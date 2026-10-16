@@ -23,7 +23,15 @@ applies the patches with `git am` and builds `build/benilla/target/release/benil
   - `collision.rs`: WoW's world (terrain, buildings, doodads) as Minecraft's collision, exact
     triangles and voxel masks, on a background thread;
   - `blocks.rs`: Minecraft's blocks, our Minecraft body, other entities, dropped items, arrows,
-    cracks and the block outline drawn in WoW's world;
+    cracks, the block outline and entity shadows drawn in WoW's world, and co-op partners (whose
+    WoW characters are hidden behind their Minecraft bodies);
+  - `cut.rs`: the terrain cut, WoW's land left out where Minecraft's blocks fill a cell or one was
+    dug (a bit volume round us that Benilla's terrain shader reads, `benilla_world::terrain_cut`);
+  - `mc_body.rs`: our Minecraft skin (`WOWCRAFT_SKIN_FILE`, or the one Minecraft sends) as our body
+    on the character select and create screens;
+  - `head_portrait.rs`: the skin's face as the player portrait;
+  - `labels.rs`: "Block trader (right-click)" under innkeepers and general goods vendors, and
+    co-op partners' name tags;
   - `overlay.rs`: Minecraft's HUD and screens over WoW's interface;
   - `water.rs`: WoW's water and lava as Minecraft's;
   - `combat.rs`: WoW's creatures as hittable stand-ins, Minecraft hits as WoW damage, WoW damage
@@ -33,4 +41,6 @@ applies the patches with `git am` and builds `build/benilla/target/release/benil
   - `ui.rs`: WoW's interface under WowCraft (action bars, Log Out, cinematic, tutorials, name).
 - Small hooks elsewhere in Benilla: the controller's puppet branch, the input gates in the
   bindings and the camera, Log Out refused, the automatic login and character creation helpers,
-  and the chat filter for the module's own GM command answers.
+  the chat filter for the module's own GM command answers, the terrain cut volume
+  (`benilla_world::terrain_cut`, bound by `terrain.wgsl`; empty and off without WowCraft), the
+  character screens' stage and the portrait sync set, and the overhead names' mesh builder.
