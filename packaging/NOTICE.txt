@@ -1,0 +1,21 @@
+WowMacCraft bundles these programs. Their licences are in this folder.
+
+- Benilla (the WoW client, wow/benilla), MIT or Apache-2.0, built for macOS from
+  https://github.com/samwhosung/benilla at commit 2e82d34c, with WowMacCraft's WowCraft
+  module added (crates/benilla-app/src/wowcraft in the WowMacCraft source).
+- vmangos (the WoW server, server/), GPL-2.0. Built unmodified for macOS from
+  https://github.com/vmangos/core at commit 4b3d241; that is its complete source.
+- MariaDB 10.11.19 (the database, mariadb/), GPL-2.0. Built unmodified for macOS from
+  https://archive.mariadb.org/mariadb-10.11.19/source/mariadb-10.11.19.tar.gz.
+- Prism Launcher 11.1.1 for macOS (prism/), GPL-3.0, the official build, unmodified. Source:
+  https://github.com/PrismLauncher/PrismLauncher (tag 11.1.1).
+- Fabric API, Apache-2.0: https://github.com/FabricMC/fabric
+- e4mc, MIT: https://github.com/vgskye/e4mc-minecraft-architectury
+- Lithium, LGPL-3.0: https://github.com/CaffeineMC/lithium
+- FerriteCore, MIT: https://github.com/malte0811/FerriteCore
+- The WowCraft Minecraft mod (a fork of SkyCraft), MIT, with its link to the WoW client moved
+  from Windows' kernel32 to macOS' POSIX shared memory (dev/skycraft/link/MacNative.class).
+- The WowCraft launcher, MIT, ported to macOS (WowMacCraft.app).
+
+No Blizzard or Mojang files are included. The server's map data is extracted on your Mac from
+your own WoW 1.12 client the first time you press Play.

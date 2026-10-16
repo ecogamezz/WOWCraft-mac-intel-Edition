@@ -136,6 +136,10 @@ impl Server {
             progress(to);
             if status.success() { Ok(()) } else { Err(format!("{exe} failed (see server/data/{exe}.log)")) }
         };
+        // The map extractor keeps its input path in 128 characters (`input_path[128]`) and cuts a
+        // longer one, then finds no MPQs ("Invalid Map.dbc file format"): a WoW folder under
+        // ~/Library or a long Games path is past that. The tools get a short link to it instead.
+        let wow = short_link(wow);
         let wow_s = wow.display().to_string();
         let wow_data = wow.join("Data").display().to_string();
 
@@ -286,8 +290,8 @@ impl Server {
                 .arg("--no-defaults")
                 .arg(format!("--basedir={}", maria.display()))
                 .arg(format!("--datadir={}", maria.join("data").display()))
-                .arg(format!("--lc-messages-dir={}", maria.join("share").join("mariadb").display()))
-                .arg(format!("--character-sets-dir={}", maria.join("share").join("mariadb").join("charsets").display()))
+                .arg(format!("--lc-messages-dir={}", maria.join("share").display()))
+                .arg(format!("--character-sets-dir={}", maria.join("share").join("charsets").display()))
                 .arg(format!("--plugin-dir={}", maria.join("lib").join("plugin").display()))
                 .arg(format!("--socket={}", self.socket().display()))
                 .arg(format!("--pid-file={}", maria.join("data").join("mariadbd.pid").display()))
@@ -379,6 +383,17 @@ impl Server {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// A short name for the WoW folder, `/tmp/wowmaccraft-<uid>-wow`, a link made fresh for each
+/// extraction; the folder itself if the link can't be made.
+fn short_link(wow: &Path) -> PathBuf {
+    let link = PathBuf::from(format!("/tmp/wowmaccraft-{}-wow", unsafe { libc::getuid() }));
+    let _ = std::fs::remove_file(&link);
+    match std::os::unix::fs::symlink(wow, &link) {
+        Ok(()) => link,
+        Err(_) => wow.to_path_buf(),
     }
 }
 
