@@ -173,3 +173,15 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+/// Removes the WoW-Minecraft link (the POSIX shared memory `/SkyCraft_v1.<uid>` WoW makes and its
+/// Minecraft lock file). Unlike a Windows mapping it outlives both games, 200 MB of it; once
+/// both have gone it's dropped, and the next WoW makes a fresh one.
+pub fn remove_link() {
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    let name = std::ffi::CString::new(format!("/SkyCraft_v1.{uid}")).unwrap();
+    // SAFETY: a valid C string; a missing name is only ENOENT.
+    unsafe { libc::shm_unlink(name.as_ptr()) };
+    let _ = std::fs::remove_file(format!("/tmp/SkyCraft_v1_minecraft.{uid}.lock"));
+}

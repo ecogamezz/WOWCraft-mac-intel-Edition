@@ -1,0 +1,1462 @@
+From 1c19444f84f279aaefe6c8f4584471a3ded12ddb Mon Sep 17 00:00:00 2001
+From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:57:32 +0200
+Subject: [PATCH 2/3] WowCraft: login from Minecraft, collision, the overlay,
+ blocks and bodies
+
+- account: the WoW account comes from Minecraft's world
+  (WOWCRAFT_ACCOUNT_FILE), behind WowCraft's wait dialog.
+- collision: every static collider the body walks on streams to Minecraft
+  in 8-block regions (exact triangles, then 1/8-block voxels with the land
+  filled two blocks deep), from a voxelizer thread, nearest first.
+- overlay: Minecraft's hotbar, hearts, hand and screens as one quad over
+  WoW's interface in the player-UI pass.
+- blocks: Minecraft's block sections, our Minecraft body and its scene as
+  meshes in our world, lit by Minecraft's own light levels.
+
+Verified live: a stand-in Minecraft received 847 regions and stood on
+Northshire's ground; its blocks and overlay showed in the client.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/benilla-app/src/login/mod.rs          |  13 +
+ crates/benilla-app/src/wowcraft/account.rs   |  97 +++
+ crates/benilla-app/src/wowcraft/blocks.rs    | 419 +++++++++++++
+ crates/benilla-app/src/wowcraft/collision.rs | 588 +++++++++++++++++++
+ crates/benilla-app/src/wowcraft/mod.rs       |  21 +-
+ crates/benilla-app/src/wowcraft/overlay.rs   | 100 ++++
+ crates/benilla-world/src/collision.rs        |   5 +
+ crates/benilla-world/src/terrain_stream.rs   |   3 +-
+ crates/wowcraft-link/src/link.rs             |  20 +-
+ 9 files changed, 1252 insertions(+), 14 deletions(-)
+ create mode 100644 crates/benilla-app/src/wowcraft/account.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/blocks.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/collision.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/overlay.rs
+
+diff --git a/crates/benilla-app/src/login/mod.rs b/crates/benilla-app/src/login/mod.rs
+index 58cfefd4..b08564d8 100644
+--- a/crates/benilla-app/src/login/mod.rs
++++ b/crates/benilla-app/src/login/mod.rs
+@@ -125,6 +125,19 @@ pub(crate) struct LoginIntent {
+ }
+ 
+ impl LoginIntent {
++    /// WowCraft: an account from Minecraft's world (`crate::wowcraft::account`), submitted at
++    /// once the way the env fast path's is; the env path is spent so it can't override it.
++    pub(crate) fn submit_external(&mut self, user: String, pass: String, now: f32) {
++        self.creds = Some((user, pass));
++        self.retry_at = Some(now);
++        self.env_read = true;
++    }
++
++    /// Credentials are held (submitted, or kept for a relist).
++    pub(crate) fn has_creds(&self) -> bool {
++        self.creds.is_some()
++    }
++
+     /// Forget the session's credentials and any scheduled retry.
+     pub(crate) fn clear(&mut self) {
+         self.creds = None;
+diff --git a/crates/benilla-app/src/wowcraft/account.rs b/crates/benilla-app/src/wowcraft/account.rs
+new file mode 100644
+index 00000000..aad934d6
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/account.rs
+@@ -0,0 +1,97 @@
++//! Logging in by ourselves: the WoW account comes from Minecraft's world. When Minecraft enters a
++//! world (ours, or a friend's through co-op), its server makes or finds our WoW account and the mod
++//! writes it to `wowcraft-coop-account.properties` (`user=`, `pass=`), which the launcher names in
++//! `WOWCRAFT_ACCOUNT_FILE` and deletes before starting us. Until it's there the login screen says
++//! so; then it submits it as a typed login would.
++
++use std::path::Path;
++
++use bevy::prelude::*;
++
++use crate::char_select::ClientState;
++use crate::glue::dialog::{DialogKind, GlueDialog};
++use crate::login::LoginIntent;
++
++/// The wait's text, as WowCraft's.
++const WAITING: &str = "Please wait...\n\nMinecraft is loading your world. You'll be logged in automatically.";
++/// How often the file is looked for (s).
++const POLL_SECS: f32 = 0.5;
++
++pub(crate) fn plugin(app: &mut App) {
++    if super::env_file("WOWCRAFT_ACCOUNT_FILE").is_some() {
++        app.add_systems(Update, wait_for_account);
++    }
++}
++
++#[derive(Default)]
++pub(crate) struct Waiting {
++    next_poll: f32,
++    showing: bool,
++}
++
++fn wait_for_account(
++    mut intent: ResMut<LoginIntent>,
++    mut dialog: ResMut<GlueDialog>,
++    state: Res<State<ClientState>>,
++    time: Res<Time>,
++    mut waiting: Local<Waiting>,
++) {
++    let Some(path) = super::env_file("WOWCRAFT_ACCOUNT_FILE") else {
++        return;
++    };
++    if *state.get() != ClientState::Login {
++        waiting.showing = false;
++        return;
++    }
++    if intent.has_creds() {
++        if waiting.showing && matches!(dialog.kind, Some(DialogKind::Status)) {
++            dialog.close();
++        }
++        waiting.showing = false;
++        return;
++    }
++    if !waiting.showing && dialog.kind.is_none() {
++        dialog.open_status(WAITING);
++        waiting.showing = true;
++    }
++    let now = time.elapsed_secs();
++    if now < waiting.next_poll {
++        return;
++    }
++    waiting.next_poll = now + POLL_SECS;
++    if let Some((user, pass)) = read_account(&path) {
++        info!("login: WowCraft co-op account {user}, from Minecraft's world");
++        if matches!(dialog.kind, Some(DialogKind::Status)) {
++            dialog.close();
++        }
++        waiting.showing = false;
++        intent.submit_external(user, pass, now);
++    }
++}
++
++/// `user=` and `pass=` from the mod's file, both present and non-empty.
++pub(crate) fn read_account(path: &Path) -> Option<(String, String)> {
++    let text = std::fs::read_to_string(path).ok()?;
++    let field = |key: &str| {
++        text.lines()
++            .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
++            .filter(|v| !v.is_empty())
++    };
++    Some((field("user=")?, field("pass=")?))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_mods_account_file_reads() {
++        let path = std::env::temp_dir().join(format!("wowmaccraft-account-{}.properties", std::process::id()));
++        std::fs::write(&path, "user=STEVE\npass=ABCD2345EFGH\n").unwrap();
++        assert_eq!(read_account(&path), Some(("STEVE".into(), "ABCD2345EFGH".into())));
++        std::fs::write(&path, "user=STEVE\n").unwrap();
++        assert_eq!(read_account(&path), None, "half written");
++        let _ = std::fs::remove_file(&path);
++        assert_eq!(read_account(&path), None, "not there yet");
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/blocks.rs b/crates/benilla-app/src/wowcraft/blocks.rs
+new file mode 100644
+index 00000000..ababb427
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/blocks.rs
+@@ -0,0 +1,419 @@
++//! Minecraft's things in WoW's world: the blocks we place (meshed by Minecraft's own block
++//! renderer, with its models, tints and ambient occlusion), our Minecraft body (skin, armour, held
++//! items, posed and animated by Minecraft), and every other entity and particle near us. The mod
++//! sends them through the render ring; here they become meshes in our world, drawn by our camera,
++//! so a block stays put in the world and WoW's walls hide it as they hide anything else.
++//!
++//! Blocks come per 16-block section and stay until replaced or removed; the body and the scene come
++//! whole every frame. Lighting is Minecraft's own, baked into the vertex colours: its block and sky
++//! light levels through its brightness curve, and its fixed face shading (up 1.0, down 0.5,
++//! north/south 0.8, east/west 0.6), which the mod leaves for us to apply.
++
++use std::collections::HashMap;
++
++use bevy::asset::RenderAssetUsages;
++use bevy::image::{ImageSampler, ImageSamplerDescriptor};
++use bevy::mesh::{Mesh, PrimitiveTopology};
++use bevy::prelude::*;
++use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
++
++use wowcraft_link::proto::*;
++
++use super::WowCraft;
++
++/// Render messages handled per frame (bytes), so a burst (a world's worth of sections) spreads.
++const BUDGET: usize = 24 << 20;
++
++pub(crate) fn plugin(app: &mut App) {
++    app.init_resource::<Scene>().add_systems(
++        Update,
++        (drain_render, place_avatar, hide_wow_body).chain().after(crate::player::PlayerControlSet),
++    );
++}
++
++/// What a batch draws with: the block/item atlas (0) or an entity texture, and whether it blends.
++#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
++struct Look {
++    texture: u32,
++    translucent: bool,
++}
++
++#[derive(Default)]
++struct Pool {
++    /// The mesh entities this pool last drew, by look; one not drawn this frame is hidden.
++    parts: HashMap<Look, (Entity, Handle<Mesh>)>,
++}
++
++#[derive(Resource, Default)]
++struct Scene {
++    atlas: Option<Handle<Image>>,
++    textures: HashMap<u32, Handle<Image>>,
++    materials: HashMap<Look, Handle<StandardMaterial>>,
++    /// A placed-block section's two meshes (cutout and translucent), by section.
++    sections: HashMap<IVec3, [Option<Entity>; 2]>,
++    /// Our body, drawn at our feet; its root follows us.
++    avatar_root: Option<Entity>,
++    avatar: Pool,
++    scene_root: Option<Entity>,
++    scene: Pool,
++    avatar_shown: bool,
++}
++
++#[allow(clippy::too_many_arguments)]
++fn drain_render(
++    wc: Res<WowCraft>,
++    mut scene: ResMut<Scene>,
++    mut commands: Commands,
++    mut images: ResMut<Assets<Image>>,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++    mut visibility: Query<&mut Visibility>,
++    mut transforms: Query<&mut Transform>,
++) {
++    let scene = &mut *scene;
++    // The two frame-whole roots, made once.
++    let avatar_root = *scene.avatar_root.get_or_insert_with(|| commands.spawn((Name::new("wowcraft avatar"), Transform::default(), Visibility::Hidden)).id());
++    let scene_root = *scene.scene_root.get_or_insert_with(|| commands.spawn((Name::new("wowcraft scene"), Transform::default(), Visibility::Visible)).id());
++    let mut drew_avatar = false;
++    let mut drew_scene = false;
++    wc.link.drain_render(BUDGET, |kind, payload| match kind {
++        REN_ATLAS => {
++            if let Some((h, pixels)) = split::<RenAtlas>(payload) {
++                let image = nearest_image(h.width, h.height, pixels);
++                let handle = images.add(image);
++                scene.atlas = Some(handle.clone());
++                // Every material on the atlas samples the new one.
++                for (look, mat) in &scene.materials {
++                    if look.texture == 0 {
++                        if let Some(m) = materials.get_mut(mat) {
++                            m.base_color_texture = Some(handle.clone());
++                        }
++                    }
++                }
++                info!("wowcraft: block atlas {}x{}", h.width, h.height);
++            }
++        }
++        REN_ATLAS_REGION => {
++            if let (Some((r, pixels)), Some(atlas)) = (split::<RenAtlasRegion>(payload), scene.atlas.as_ref()) {
++                if let Some(image) = images.get_mut(atlas) {
++                    blit(image, r.x, r.y, r.width, r.height, pixels);
++                }
++            }
++        }
++        REN_TEXTURE => {
++            if let Some((t, pixels)) = split::<RenTexture>(payload) {
++                let handle = images.add(nearest_image(t.width, t.height, pixels));
++                scene.textures.insert(t.id, handle.clone());
++                for (look, mat) in &scene.materials {
++                    if look.texture == t.id {
++                        if let Some(m) = materials.get_mut(mat) {
++                            m.base_color_texture = Some(handle.clone());
++                        }
++                    }
++                }
++            }
++        }
++        REN_CLEAR_ALL => {
++            for (_, parts) in scene.sections.drain() {
++                for e in parts.into_iter().flatten() {
++                    commands.entity(e).despawn();
++                }
++            }
++        }
++        REN_SECTION => {
++            let Some((s, body)) = split::<RenSection>(payload) else { return };
++            let key = IVec3::new(s.sx, s.sy, s.sz);
++            let verts: &[RenVertex] = vertices(body, s.vertex_count as usize);
++            for e in scene.sections.remove(&key).unwrap_or_default().into_iter().flatten() {
++                commands.entity(e).despawn();
++            }
++            if verts.is_empty() {
++                return;
++            }
++            let origin = (key * 16).as_vec3();
++            let mut parts = [None, None];
++            for (slot, translucent) in [(0, false), (1, true)] {
++                let mine: Vec<RenVertex> = verts.iter().filter(|v| (v.flags & 2 != 0) == translucent).copied().collect();
++                if mine.is_empty() {
++                    continue;
++                }
++                let mesh = meshes.add(mesh_of(&mine, true));
++                let material = material(scene, &mut materials, Look { texture: 0, translucent });
++                parts[slot] = Some(
++                    commands
++                        .spawn((Name::new("wowcraft blocks"), Mesh3d(mesh), MeshMaterial3d(material), Transform::from_translation(origin)))
++                        .id(),
++                );
++            }
++            scene.sections.insert(key, parts);
++        }
++        REN_AVATAR => {
++            let Some((c, body)) = split::<RenCounts>(payload) else { return };
++            drew_avatar = true;
++            scene.avatar_shown = c.batch_count > 0;
++            draw_batches(scene, true, avatar_root, c.batch_count, c.vertex_count, body, &mut commands, &mut meshes, &mut materials, &mut visibility);
++        }
++        REN_SCENE => {
++            let Some((s, body)) = split::<RenScene>(payload) else { return };
++            drew_scene = true;
++            if let Ok(mut t) = transforms.get_mut(scene_root) {
++                t.translation = Vec3::new(s.origin[0] as f32, s.origin[1] as f32, s.origin[2] as f32);
++            }
++            draw_batches(scene, false, scene_root, s.batch_count, s.vertex_count, body, &mut commands, &mut meshes, &mut materials, &mut visibility);
++        }
++        // Lights are Minecraft's own and already in the vertex colours; the solids, dug and cut
++        // sets are for WoW's terrain, which keeps drawing.
++        _ => {}
++    });
++    let _ = (drew_avatar, drew_scene);
++    if !wc.mc_in_world() {
++        scene.avatar_shown = false;
++    }
++}
++
++/// A frame-whole message's batches into its pool: one mesh per look, the rest hidden.
++#[allow(clippy::too_many_arguments)]
++fn draw_batches(
++    scene: &mut Scene,
++    avatar: bool,
++    root: Entity,
++    batch_count: u32,
++    vertex_count: u32,
++    body: &[u8],
++    commands: &mut Commands,
++    meshes: &mut Assets<Mesh>,
++    materials: &mut Assets<StandardMaterial>,
++    visibility: &mut Query<&mut Visibility>,
++) {
++    let batch_bytes = batch_count as usize * std::mem::size_of::<RenBatch>();
++    if body.len() < batch_bytes {
++        return;
++    }
++    let size = std::mem::size_of::<RenBatch>();
++    let batches: Vec<RenBatch> = (0..batch_count as usize)
++        .map(|i| bytemuck::pod_read_unaligned(&body[i * size..(i + 1) * size]))
++        .collect();
++    let verts = vertices(&body[batch_bytes..], vertex_count as usize);
++    let mut by_look: HashMap<Look, Vec<RenVertex>> = HashMap::new();
++    for b in &batches {
++        let (first, count) = (b.first as usize, b.count as usize);
++        if first + count > verts.len() {
++            continue;
++        }
++        let look = Look { texture: b.texture, translucent: b.flags & 1 != 0 };
++        by_look.entry(look).or_default().extend_from_slice(&verts[first..first + count]);
++    }
++    let pool_keys: Vec<Look> = if avatar { scene.avatar.parts.keys().copied().collect() } else { scene.scene.parts.keys().copied().collect() };
++    for look in pool_keys {
++        if !by_look.contains_key(&look) {
++            let pool = if avatar { &scene.avatar } else { &scene.scene };
++            if let Some((e, _)) = pool.parts.get(&look) {
++                if let Ok(mut v) = visibility.get_mut(*e) {
++                    *v = Visibility::Hidden;
++                }
++            }
++        }
++    }
++    for (look, verts) in by_look {
++        let mesh = mesh_of(&verts, false);
++        let existing = if avatar { scene.avatar.parts.get(&look).cloned() } else { scene.scene.parts.get(&look).cloned() };
++        match existing {
++            Some((e, handle)) => {
++                let _ = meshes.insert(&handle, mesh);
++                if let Ok(mut v) = visibility.get_mut(e) {
++                    *v = Visibility::Inherited;
++                }
++            }
++            None => {
++                let handle = meshes.add(mesh);
++                let mat = material(scene, materials, look);
++                let e = commands
++                    .spawn((Name::new("wowcraft entity"), Mesh3d(handle.clone()), MeshMaterial3d(mat), Transform::default(), Visibility::Inherited, ChildOf(root)))
++                    .id();
++                if avatar {
++                    scene.avatar.parts.insert(look, (e, handle));
++                } else {
++                    scene.scene.parts.insert(look, (e, handle));
++                }
++            }
++        }
++    }
++}
++
++/// Our body stands where our WoW body stands (Minecraft posed it facing its way, from the feet).
++fn place_avatar(scene: Res<Scene>, player: Res<crate::player::Player>, mut q: Query<(&mut Transform, &mut Visibility)>) {
++    let Some(root) = scene.avatar_root else { return };
++    if let Ok((mut t, mut v)) = q.get_mut(root) {
++        t.translation = player.pos;
++        let want = if scene.avatar_shown { Visibility::Visible } else { Visibility::Hidden };
++        if *v != want {
++            *v = want;
++        }
++    }
++}
++
++/// Our WoW body isn't drawn: we are the Minecraft body (first person shows only its hand).
++fn hide_wow_body(wc: Res<WowCraft>, mut bodies: Query<&mut Visibility, With<crate::net::SelfPlayer>>) {
++    if !wc.mc_in_world() {
++        return;
++    }
++    for mut v in &mut bodies {
++        if *v != Visibility::Hidden {
++            *v = Visibility::Hidden;
++        }
++    }
++}
++
++fn material(scene: &mut Scene, materials: &mut Assets<StandardMaterial>, look: Look) -> Handle<StandardMaterial> {
++    if let Some(m) = scene.materials.get(&look) {
++        return m.clone();
++    }
++    let texture = if look.texture == 0 { scene.atlas.clone() } else { scene.textures.get(&look.texture).cloned() };
++    let m = materials.add(StandardMaterial {
++        base_color_texture: texture,
++        // Minecraft's own light is in the vertex colours.
++        unlit: true,
++        alpha_mode: if look.translucent { AlphaMode::Blend } else { AlphaMode::Mask(0.1) },
++        cull_mode: None,
++        ..default()
++    });
++    scene.materials.insert(look, m.clone());
++    m
++}
++
++/// A message's fixed header and what follows it.
++fn split<T: bytemuck::Pod>(payload: &[u8]) -> Option<(T, &[u8])> {
++    let n = std::mem::size_of::<T>();
++    (payload.len() >= n).then(|| (bytemuck::pod_read_unaligned(&payload[..n]), &payload[n..]))
++}
++
++fn vertices(body: &[u8], count: usize) -> &[RenVertex] {
++    let n = (body.len() / std::mem::size_of::<RenVertex>()).min(count);
++    // The ring keeps messages 8-byte aligned and a vertex is 32 bytes of 4-byte fields.
++    bytemuck::try_cast_slice(&body[..n * std::mem::size_of::<RenVertex>()]).unwrap_or(&[])
++}
++
++/// Minecraft's brightness curve (`LightTexture`, no ambient): a light level 0-15 to 0..1.
++fn brightness(level: u32) -> f32 {
++    let l = (level.min(15) as f32) / 15.0;
++    l / (4.0 - 3.0 * l)
++}
++
++/// Minecraft's fixed shading of a block face, by its Direction ordinal (down, up, north, south,
++/// west, east).
++fn face_shade(dir: u32) -> f32 {
++    match dir {
++        0 => 0.5,
++        1 => 1.0,
++        2 | 3 => 0.8,
++        4 | 5 => 0.6,
++        _ => 1.0,
++    }
++}
++
++fn face_normal(dir: u32) -> [f32; 3] {
++    match dir {
++        0 => [0.0, -1.0, 0.0],
++        1 => [0.0, 1.0, 0.0],
++        2 => [0.0, 0.0, -1.0],
++        3 => [0.0, 0.0, 1.0],
++        4 => [-1.0, 0.0, 0.0],
++        5 => [1.0, 0.0, 0.0],
++        _ => [0.0, 1.0, 0.0],
++    }
++}
++
++fn srgb_to_linear(c: u8) -> f32 {
++    let c = c as f32 / 255.0;
++    if c <= 0.04045 {
++        c / 12.92
++    } else {
++        ((c + 0.055) / 1.055).powf(2.4)
++    }
++}
++
++/// A triangle list of Minecraft vertices; `shade` applies the block faces' fixed shading.
++fn mesh_of(verts: &[RenVertex], shade: bool) -> Mesh {
++    let mut pos = Vec::with_capacity(verts.len());
++    let mut uv = Vec::with_capacity(verts.len());
++    let mut col = Vec::with_capacity(verts.len());
++    let mut nrm = Vec::with_capacity(verts.len());
++    for v in verts {
++        pos.push(v.pos);
++        uv.push(v.uv);
++        let dir = ((v.flags >> 4) & 7).wrapping_sub(1);
++        let block = v.light & 0xF;
++        let sky = (v.light >> 8) & 0xF;
++        let lit = brightness(block).max(brightness(sky)).max(0.04);
++        let k = lit * if shade { face_shade(dir) } else { 1.0 };
++        let c = v.color.to_le_bytes();
++        col.push([srgb_to_linear(c[0]) * k, srgb_to_linear(c[1]) * k, srgb_to_linear(c[2]) * k, c[3] as f32 / 255.0]);
++        nrm.push(face_normal(dir));
++    }
++    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
++        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, pos)
++        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, nrm)
++        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uv)
++        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, col)
++}
++
++/// Pixel art stays pixels: nearest filtering, as Minecraft draws it.
++fn nearest_image(w: u32, h: u32, pixels: &[u8]) -> Image {
++    let mut image = Image::new_fill(
++        Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
++        TextureDimension::D2,
++        &[0, 0, 0, 0],
++        TextureFormat::Rgba8UnormSrgb,
++        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
++    );
++    let n = (w * h * 4) as usize;
++    if pixels.len() >= n {
++        image.data = Some(pixels[..n].to_vec());
++    }
++    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor::nearest());
++    image
++}
++
++/// An animated sprite's frame into its place in the atlas.
++fn blit(image: &mut Image, x: u32, y: u32, w: u32, h: u32, pixels: &[u8]) {
++    let iw = image.width();
++    let ih = image.height();
++    let Some(data) = image.data.as_mut() else { return };
++    if x + w > iw || y + h > ih || pixels.len() < (w * h * 4) as usize {
++        return;
++    }
++    for row in 0..h {
++        let dst = (((y + row) * iw + x) * 4) as usize;
++        let src = (row * w * 4) as usize;
++        data[dst..dst + (w * 4) as usize].copy_from_slice(&pixels[src..src + (w * 4) as usize]);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn light_follows_minecrafts_curve() {
++        assert_eq!(brightness(15), 1.0);
++        assert_eq!(brightness(0), 0.0);
++        assert!((brightness(8) - 0.2286).abs() < 1e-3, "{}", brightness(8));
++    }
++
++    #[test]
++    fn a_vertex_gets_its_face_and_light() {
++        let v = RenVertex {
++            pos: [0.0, 1.0, 0.0],
++            uv: [0.5, 0.5],
++            color: u32::from_le_bytes([255, 255, 255, 255]),
++            light: 15 << 8,
++            // Up (ordinal 1) is stored as 2.
++            flags: 2 << 4,
++        };
++        let down = RenVertex { flags: 1 << 4, ..v };
++        let mesh = mesh_of(&[v, down, v], true);
++        let Some(bevy::mesh::VertexAttributeValues::Float32x4(c)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else { panic!() };
++        assert_eq!(c[0], [1.0, 1.0, 1.0, 1.0], "a sunlit top face");
++        assert_eq!(c[1][0], 0.5, "a bottom face at half");
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/collision.rs b/crates/benilla-app/src/wowcraft/collision.rs
+new file mode 100644
+index 00000000..95a1bae1
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/collision.rs
+@@ -0,0 +1,588 @@
++//! WoW's ground, buildings and doodads, for Minecraft to stand on. Minecraft's world is empty: its
++//! player walks on our collision, which streams to it in 8-block regions around us. Each region
++//! goes as its exact triangles (`COL_TRIS`, which the mod's smooth collider moves the player
++//! against) and then as 1/8-block voxels (`COL_REGION`, which every other entity collides with, and
++//! which tells Minecraft the region is known so it lets its player go).
++//!
++//! The triangles come from the colliders the client already builds for its own body: every static
++//! collider on the default or the walking layer (terrain, WMOs, doodads), never the camera's or
++//! liquid. A main-thread system hands each one's shape to the `wowcraft-voxelize` thread as it
++//! attaches and its removal as it goes; the thread indexes the triangles by region and streams the
++//! regions nearest us first, once the world around us is resident.
++
++use std::collections::{HashMap, HashSet};
++use std::sync::Arc;
++use std::time::Duration;
++
++use avian3d::parry::shape::SharedShape;
++use avian3d::prelude::{Collider, CollisionLayers, RigidBody};
++use bevy::prelude::*;
++use crossbeam_channel::{Receiver, Sender};
++
++use wowcraft_link::proto::*;
++use wowcraft_link::Link;
++
++/// A region is this many blocks on a side, as the mod's `SkyCollision.REGION_SIZE`.
++pub(crate) const REGION: i32 = 8;
++/// Sub-voxels a block, a side.
++const SUB: i32 = 8;
++/// Regions streamed around us: this many out horizontally (5 · 8 = 40 blocks), and vertically.
++const REACH_XZ: i32 = 5;
++const REACH_Y: i32 = 3;
++/// Regions built and sent per pass, nearest first.
++const PER_PASS: usize = 48;
++/// The land is solid this far under its surface (blocks), for what rests on it; deeper is left
++/// open, so a cave under a hill isn't filled.
++const FILL_DEPTH: f32 = 2.0;
++/// The avian layer bits of benilla-world's `CollisionLayer`: Default, Walk (the body's), Camera,
++/// Liquid. A collider the body walks on is in one of the first two.
++const BODY_LAYERS: u32 = 0b0011;
++
++/// Where the exporter thread is told what to do.
++#[derive(Resource)]
++pub(crate) struct Exporter {
++    tx: Sender<Msg>,
++}
++
++enum Msg {
++    Add { id: u64, shape: SharedShape, translation: Vec3, rotation: Quat, flags: u32 },
++    Remove { id: u64 },
++    Focus { feet: Vec3, epoch: u32, settled: bool },
++}
++
++pub(crate) fn plugin(app: &mut App, link: Arc<Link>) {
++    let (tx, rx) = crossbeam_channel::unbounded();
++    let spawned = std::thread::Builder::new()
++        .name("wowcraft-voxelize".into())
++        .spawn(move || Voxelizer::new(link, rx).run());
++    if let Err(e) = spawned {
++        error!("wowcraft: couldn't start the collision thread: {e}");
++        return;
++    }
++    app.insert_resource(Exporter { tx }).add_systems(
++        PostUpdate,
++        feed.after(bevy::transform::TransformSystems::Propagate),
++    );
++}
++
++/// Hand the thread every static collider the body walks on as it attaches, its removal as it goes,
++/// and where we are.
++#[allow(clippy::type_complexity)]
++fn feed(
++    exporter: Res<Exporter>,
++    wc: Res<super::WowCraft>,
++    player: Res<crate::player::Player>,
++    cover: Option<Res<crate::loading_screen::LoadingScreen>>,
++    added: Query<
++        (
++            Entity,
++            &Collider,
++            &GlobalTransform,
++            Option<&CollisionLayers>,
++            Option<&RigidBody>,
++            Has<benilla_world::collision::TerrainSurface>,
++        ),
++        Added<Collider>,
++    >,
++    mut removed: RemovedComponents<Collider>,
++) {
++    for (entity, collider, gt, layers, body, terrain) in &added {
++        if !matches!(body, Some(RigidBody::Static)) {
++            continue;
++        }
++        if layers.is_some_and(|l| l.memberships.0 & BODY_LAYERS == 0) {
++            continue;
++        }
++        let (_, rotation, translation) = gt.to_scale_rotation_translation();
++        let flags = if terrain { TRI_TERRAIN | TRI_DIGGABLE | (DIG_GRASS << TRI_MATERIAL_SHIFT) } else { 0 };
++        let _ = exporter.tx.send(Msg::Add {
++            id: entity.to_bits(),
++            shape: collider.shape_scaled().clone(),
++            translation,
++            rotation,
++            flags,
++        });
++    }
++    for entity in removed.read() {
++        let _ = exporter.tx.send(Msg::Remove { id: entity.to_bits() });
++    }
++    let settled = player.active && !player.settling && !cover.is_some_and(|c| c.covering());
++    let _ = exporter.tx.send(Msg::Focus {
++        feet: player.pos,
++        epoch: wc.collision_epoch(),
++        settled,
++    });
++}
++
++/// One collider's triangles, world space.
++struct Body {
++    tris: Vec<[Vec3; 3]>,
++    flags: u32,
++    regions: Vec<IVec3>,
++}
++
++struct Voxelizer {
++    link: Arc<Link>,
++    rx: Receiver<Msg>,
++    bodies: HashMap<u64, Body>,
++    /// Region -> (body, triangle) of every triangle touching it.
++    regions: HashMap<IVec3, Vec<(u64, u32)>>,
++    /// A region's column (x, z) -> the land's triangles over it, for the fill under the surface.
++    land: HashMap<IVec2, Vec<(u64, u32)>>,
++    sent: HashSet<IVec3>,
++    dirty: HashSet<IVec3>,
++    epoch: u32,
++    feet: Vec3,
++    settled: bool,
++    cleared: bool,
++}
++
++impl Voxelizer {
++    fn new(link: Arc<Link>, rx: Receiver<Msg>) -> Self {
++        Voxelizer {
++            link,
++            rx,
++            bodies: HashMap::new(),
++            regions: HashMap::new(),
++            land: HashMap::new(),
++            sent: HashSet::new(),
++            dirty: HashSet::new(),
++            epoch: 0,
++            feet: Vec3::ZERO,
++            settled: false,
++            cleared: false,
++        }
++    }
++
++    fn run(mut self) {
++        loop {
++            match self.rx.recv_timeout(Duration::from_millis(20)) {
++                Ok(msg) => self.apply(msg),
++                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
++                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
++            }
++            while let Ok(msg) = self.rx.try_recv() {
++                self.apply(msg);
++            }
++            self.stream();
++        }
++    }
++
++    fn apply(&mut self, msg: Msg) {
++        match msg {
++            Msg::Add { id, shape, translation, rotation, flags } => {
++                let mut tris = Vec::new();
++                triangles(&shape, translation, rotation, &mut tris);
++                if flags & TRI_TERRAIN != 0 {
++                    // The land faces up: digging reads its winding as out of the solid side.
++                    for t in &mut tris {
++                        if (t[1] - t[0]).cross(t[2] - t[0]).y < 0.0 {
++                            t.swap(1, 2);
++                        }
++                    }
++                }
++                self.add(id, Body { tris, flags, regions: Vec::new() });
++            }
++            Msg::Remove { id } => self.remove(id),
++            Msg::Focus { feet, epoch, settled } => {
++                if epoch != self.epoch || !self.cleared {
++                    // A new world (or our first word): Minecraft drops what it holds.
++                    if self.link.write_collision(COL_CLEAR, &epoch.to_le_bytes()) {
++                        self.epoch = epoch;
++                        self.cleared = true;
++                        self.sent.clear();
++                        self.dirty.clear();
++                    }
++                }
++                self.feet = feet;
++                self.settled = settled;
++            }
++        }
++    }
++
++    fn add(&mut self, id: u64, mut body: Body) {
++        self.remove(id);
++        let mut touched = HashSet::new();
++        for (i, t) in body.tris.iter().enumerate() {
++            let lo = t[0].min(t[1]).min(t[2]);
++            let hi = t[0].max(t[1]).max(t[2]);
++            let (r0, r1) = (region_of(lo), region_of(hi));
++            for x in r0.x..=r1.x {
++                for y in r0.y..=r1.y {
++                    for z in r0.z..=r1.z {
++                        let r = IVec3::new(x, y, z);
++                        self.regions.entry(r).or_default().push((id, i as u32));
++                        touched.insert(r);
++                    }
++                }
++            }
++            if body.flags & TRI_TERRAIN != 0 {
++                for x in r0.x..=r1.x {
++                    for z in r0.z..=r1.z {
++                        self.land.entry(IVec2::new(x, z)).or_default().push((id, i as u32));
++                    }
++                }
++            }
++        }
++        body.regions = touched.into_iter().collect();
++        self.mark_dirty(&body.regions, body.flags & TRI_TERRAIN != 0);
++        self.bodies.insert(id, body);
++    }
++
++    fn remove(&mut self, id: u64) {
++        let Some(body) = self.bodies.remove(&id) else {
++            return;
++        };
++        for r in &body.regions {
++            if let Some(list) = self.regions.get_mut(r) {
++                list.retain(|(b, _)| *b != id);
++                if list.is_empty() {
++                    self.regions.remove(r);
++                }
++            }
++            if body.flags & TRI_TERRAIN != 0 {
++                if let Some(list) = self.land.get_mut(&IVec2::new(r.x, r.z)) {
++                    list.retain(|(b, _)| *b != id);
++                }
++            }
++        }
++        self.mark_dirty(&body.regions, body.flags & TRI_TERRAIN != 0);
++    }
++
++    /// Regions already sent that changed; land changes the fill of the whole column below it.
++    fn mark_dirty(&mut self, regions: &[IVec3], land: bool) {
++        for r in regions {
++            if self.sent.contains(r) {
++                self.dirty.insert(*r);
++            }
++            if land {
++                let below = *r - IVec3::Y;
++                if self.sent.contains(&below) {
++                    self.dirty.insert(below);
++                }
++            }
++        }
++    }
++
++    /// The regions around us not yet sent (or changed since), nearest first, a pass's worth.
++    fn stream(&mut self) {
++        if !self.settled || !self.cleared {
++            return;
++        }
++        let c = region_of(self.feet);
++        let mut wanted: Vec<IVec3> = Vec::new();
++        for dx in -REACH_XZ..=REACH_XZ {
++            for dz in -REACH_XZ..=REACH_XZ {
++                for dy in -REACH_Y..=REACH_Y {
++                    let r = c + IVec3::new(dx, dy, dz);
++                    if !self.sent.contains(&r) || self.dirty.contains(&r) {
++                        wanted.push(r);
++                    }
++                }
++            }
++        }
++        if wanted.is_empty() {
++            return;
++        }
++        wanted.sort_by_key(|r| {
++            let d = *r - c;
++            d.x * d.x + d.z * d.z + 4 * d.y * d.y
++        });
++        for r in wanted.into_iter().take(PER_PASS) {
++            let (tris, blocks) = self.build(r);
++            if !self.send(r, &tris, &blocks) {
++                // The ring is full: Minecraft is behind; the rest wait for the next pass.
++                break;
++            }
++            self.sent.insert(r);
++            self.dirty.remove(&r);
++        }
++    }
++
++    fn send(&self, r: IVec3, tris: &[ColTri], blocks: &[ColBlock]) -> bool {
++        let min = r * REGION;
++        let header = |count: usize| ColRegion {
++            min: min.to_array(),
++            max: (min + IVec3::splat(REGION - 1)).to_array(),
++            epoch: self.epoch,
++            count: count as u32,
++        };
++        let mut payload = Vec::with_capacity(32 + tris.len() * 40);
++        payload.extend_from_slice(bytemuck::bytes_of(&header(tris.len())));
++        payload.extend_from_slice(bytemuck::cast_slice(tris));
++        if !self.link.write_collision(COL_TRIS, &payload) {
++            return false;
++        }
++        payload.clear();
++        payload.extend_from_slice(bytemuck::bytes_of(&header(blocks.len())));
++        payload.extend_from_slice(bytemuck::cast_slice(blocks));
++        // Spin briefly if the voxels don't fit right after their triangles: they must follow.
++        for _ in 0..200 {
++            if self.link.write_collision(COL_REGION, &payload) {
++                return true;
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        false
++    }
++
++    /// One region's triangles and voxels.
++    fn build(&self, r: IVec3) -> (Vec<ColTri>, Vec<ColBlock>) {
++        let min = (r * REGION).as_vec3();
++        let mut tris = Vec::new();
++        let mut grid = Grid::default();
++        if let Some(list) = self.regions.get(&r) {
++            for &(b, i) in list {
++                let Some(body) = self.bodies.get(&b) else { continue };
++                let t = body.tris[i as usize];
++                tris.push(ColTri {
++                    v: [t[0].x, t[0].y, t[0].z, t[1].x, t[1].y, t[1].z, t[2].x, t[2].y, t[2].z],
++                    flags: body.flags,
++                });
++                grid.rasterize(&t, min);
++            }
++        }
++        // Under the land, solid for FILL_DEPTH.
++        if let Some(list) = self.land.get(&IVec2::new(r.x, r.z)) {
++            let land: Vec<[Vec3; 3]> = list
++                .iter()
++                .filter_map(|&(b, i)| self.bodies.get(&b).map(|body| body.tris[i as usize]))
++                .collect();
++            grid.fill_under(&land, min, FILL_DEPTH);
++        }
++        (tris, grid.blocks(r * REGION))
++    }
++}
++
++fn region_of(p: Vec3) -> IVec3 {
++    IVec3::new(
++        (p.x.floor() as i32).div_euclid(REGION),
++        (p.y.floor() as i32).div_euclid(REGION),
++        (p.z.floor() as i32).div_euclid(REGION),
++    )
++}
++
++/// A shape's triangles, posed in the world.
++fn triangles(shape: &SharedShape, translation: Vec3, rotation: Quat, out: &mut Vec<[Vec3; 3]>) {
++    let pose = |p: [f32; 3]| translation + rotation * Vec3::from_array(p);
++    let mut push = |verts: &[[f32; 3]], indices: &[[u32; 3]]| {
++        for idx in indices {
++            let t = [pose(verts[idx[0] as usize]), pose(verts[idx[1] as usize]), pose(verts[idx[2] as usize])];
++            if (t[1] - t[0]).cross(t[2] - t[0]).length_squared() > 1.0e-10 {
++                out.push(t);
++            }
++        }
++    };
++    if let Some(mesh) = shape.as_trimesh() {
++        let verts: Vec<[f32; 3]> = mesh.vertices().iter().map(|v| [v.x, v.y, v.z]).collect();
++        push(&verts, mesh.indices());
++    } else if let Some(compound) = shape.as_compound() {
++        for (sub_pose, sub) in compound.shapes() {
++            let t = sub_pose.translation;
++            let q = sub_pose.rotation;
++            let sub_t = translation + rotation * Vec3::new(t.x, t.y, t.z);
++            let sub_r = rotation * Quat::from_xyzw(q.x, q.y, q.z, q.w);
++            triangles(sub, sub_t, sub_r, out);
++        }
++    } else if let Some(hull) = shape.as_convex_polyhedron() {
++        let (v, i) = hull.to_trimesh();
++        let verts: Vec<[f32; 3]> = v.iter().map(|v| [v.x, v.y, v.z]).collect();
++        push(&verts, &i);
++    } else if let Some(cuboid) = shape.as_cuboid() {
++        let (v, i) = cuboid.to_trimesh();
++        let verts: Vec<[f32; 3]> = v.iter().map(|v| [v.x, v.y, v.z]).collect();
++        push(&verts, &i);
++    } else if let Some(field) = shape.as_heightfield() {
++        let (v, i) = field.to_trimesh();
++        let verts: Vec<[f32; 3]> = v.iter().map(|v| [v.x, v.y, v.z]).collect();
++        push(&verts, &i);
++    }
++}
++
++/// A region's 64³ sub-voxels, as its 512 blocks of eight 64-bit layers.
++struct Grid {
++    bits: Vec<u64>,
++}
++
++impl Default for Grid {
++    fn default() -> Self {
++        Grid { bits: vec![0; (REGION * REGION * REGION * SUB) as usize] }
++    }
++}
++
++impl Grid {
++    const N: i32 = REGION * SUB;
++
++    fn set(&mut self, x: i32, y: i32, z: i32) {
++        if !(0..Self::N).contains(&x) || !(0..Self::N).contains(&y) || !(0..Self::N).contains(&z) {
++            return;
++        }
++        let block = ((y / SUB) * REGION + z / SUB) * REGION + x / SUB;
++        let layer = (y % SUB) as usize;
++        self.bits[block as usize * SUB as usize + layer] |= 1u64 << ((z % SUB) * SUB + x % SUB);
++    }
++
++    /// Every sub-voxel the triangle touches (a box-triangle overlap test per cell of its bounds).
++    fn rasterize(&mut self, t: &[Vec3; 3], min: Vec3) {
++        let s = SUB as f32;
++        let local = [(t[0] - min) * s, (t[1] - min) * s, (t[2] - min) * s];
++        let lo = local[0].min(local[1]).min(local[2]).floor().max(Vec3::ZERO);
++        let hi = local[0].max(local[1]).max(local[2]).floor().min(Vec3::splat((Self::N - 1) as f32));
++        if lo.x > hi.x || lo.y > hi.y || lo.z > hi.z {
++            return;
++        }
++        for x in lo.x as i32..=hi.x as i32 {
++            for y in lo.y as i32..=hi.y as i32 {
++                for z in lo.z as i32..=hi.z as i32 {
++                    let centre = Vec3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
++                    if tri_box_overlap(centre, Vec3::splat(0.5), &local) {
++                        self.set(x, y, z);
++                    }
++                }
++            }
++        }
++    }
++
++    /// Solid from the land's surface down `depth` blocks, over every sub-column the land covers.
++    fn fill_under(&mut self, land: &[[Vec3; 3]], min: Vec3, depth: f32) {
++        let s = SUB as f32;
++        let mut top = vec![f32::NEG_INFINITY; (Self::N * Self::N) as usize];
++        for t in land {
++            let local = [(t[0] - min) * s, (t[1] - min) * s, (t[2] - min) * s];
++            let lo = local[0].min(local[1]).min(local[2]).floor().max(Vec3::ZERO);
++            let hi = local[0].max(local[1]).max(local[2]).floor().min(Vec3::splat((Self::N - 1) as f32));
++            for x in lo.x as i32..=hi.x as i32 {
++                for z in lo.z as i32..=hi.z as i32 {
++                    if let Some(y) = height_at(&local, x as f32 + 0.5, z as f32 + 0.5) {
++                        let cell = &mut top[(z * Self::N + x) as usize];
++                        *cell = cell.max(y);
++                    }
++                }
++            }
++        }
++        let depth = depth * s;
++        for x in 0..Self::N {
++            for z in 0..Self::N {
++                let h = top[(z * Self::N + x) as usize];
++                if !h.is_finite() {
++                    continue;
++                }
++                let from = ((h - depth).floor() as i32).max(0);
++                let to = (h.floor() as i32).min(Self::N);
++                for y in from..to {
++                    self.set(x, y, z);
++                }
++            }
++        }
++    }
++
++    /// The non-empty blocks, at their world positions.
++    fn blocks(&self, origin: IVec3) -> Vec<ColBlock> {
++        let mut out = Vec::new();
++        for by in 0..REGION {
++            for bz in 0..REGION {
++                for bx in 0..REGION {
++                    let block = ((by * REGION + bz) * REGION + bx) as usize * SUB as usize;
++                    let layers: [u64; 8] = self.bits[block..block + 8].try_into().unwrap();
++                    if layers.iter().any(|&l| l != 0) {
++                        out.push(ColBlock {
++                            pos: (origin + IVec3::new(bx, by, bz)).to_array(),
++                            pad: 0,
++                            bits: layers,
++                        });
++                    }
++                }
++            }
++        }
++        out
++    }
++}
++
++/// The land's height over (x, z), if the triangle's top view covers it.
++fn height_at(t: &[Vec3; 3], x: f32, z: f32) -> Option<f32> {
++    let (a, b, c) = (t[0], t[1], t[2]);
++    let d = (b.z - c.z) * (a.x - c.x) + (c.x - b.x) * (a.z - c.z);
++    if d.abs() < 1.0e-9 {
++        return None;
++    }
++    let w0 = ((b.z - c.z) * (x - c.x) + (c.x - b.x) * (z - c.z)) / d;
++    let w1 = ((c.z - a.z) * (x - c.x) + (a.x - c.x) * (z - c.z)) / d;
++    let w2 = 1.0 - w0 - w1;
++    const E: f32 = -1.0e-4;
++    (w0 >= E && w1 >= E && w2 >= E).then(|| w0 * a.y + w1 * b.y + w2 * c.y)
++}
++
++/// Akenine-Möller's triangle/box overlap: the box's three axes, the triangle's normal, and the
++/// nine edge-cross axes.
++fn tri_box_overlap(centre: Vec3, half: Vec3, t: &[Vec3; 3]) -> bool {
++    let v = [t[0] - centre, t[1] - centre, t[2] - centre];
++    let e = [v[1] - v[0], v[2] - v[1], v[0] - v[2]];
++    for edge in e {
++        for axis in [Vec3::X, Vec3::Y, Vec3::Z] {
++            let a = axis.cross(edge);
++            if a.length_squared() < 1.0e-12 {
++                continue;
++            }
++            let p = [v[0].dot(a), v[1].dot(a), v[2].dot(a)];
++            let r = half.x * a.x.abs() + half.y * a.y.abs() + half.z * a.z.abs();
++            if p.iter().cloned().fold(f32::INFINITY, f32::min) > r || p.iter().cloned().fold(f32::NEG_INFINITY, f32::max) < -r {
++                return false;
++            }
++        }
++    }
++    for i in 0..3 {
++        let lo = v[0][i].min(v[1][i]).min(v[2][i]);
++        let hi = v[0][i].max(v[1][i]).max(v[2][i]);
++        if lo > half[i] || hi < -half[i] {
++            return false;
++        }
++    }
++    let n = e[0].cross(e[1]);
++    let r = half.x * n.x.abs() + half.y * n.y.abs() + half.z * n.z.abs();
++    n.dot(v[0]).abs() <= r
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn regions_floor_toward_negative() {
++        assert_eq!(region_of(Vec3::new(0.0, 0.0, 0.0)), IVec3::ZERO);
++        assert_eq!(region_of(Vec3::new(7.99, 8.0, -0.01)), IVec3::new(0, 1, -1));
++        assert_eq!(region_of(Vec3::new(-8.0, -8.01, 132.5)), IVec3::new(-1, -2, 16));
++    }
++
++    #[test]
++    fn a_flat_floor_is_one_voxel_thick_and_the_land_fills_under() {
++        // A floor at y = 3.03 over the region's first block column.
++        let floor = [Vec3::new(0.0, 3.03, 0.0), Vec3::new(8.0, 3.03, 0.0), Vec3::new(0.0, 3.03, 8.0)];
++        let mut g = Grid::default();
++        g.rasterize(&floor, Vec3::ZERO);
++        let blocks = g.blocks(IVec3::ZERO);
++        // Its layer is block y 3, sub-voxel y 0 (3.03 · 8 = 24.2 → 24).
++        let b = blocks.iter().find(|b| b.pos == [0, 3, 0]).expect("the floor's block");
++        assert_eq!(b.bits[0], u64::MAX, "the corner block's bottom layer is all floor");
++        assert!(b.bits[1..].iter().all(|&l| l == 0), "and nothing above it");
++        let mut land = Grid::default();
++        land.fill_under(&[floor], Vec3::ZERO, 2.0);
++        let filled = land.blocks(IVec3::ZERO);
++        assert!(filled.iter().any(|b| b.pos == [0, 2, 0] && b.bits.iter().all(|&l| l == u64::MAX)), "a full block under the surface");
++        assert!(!filled.iter().any(|b| b.pos[1] == 0), "deeper than two blocks stays open");
++    }
++
++    #[test]
++    fn the_overlap_test_tells_touching_from_missing() {
++        let t = [Vec3::new(-1.0, 0.0, -1.0), Vec3::new(1.0, 0.0, -1.0), Vec3::new(0.0, 0.0, 1.0)];
++        assert!(tri_box_overlap(Vec3::new(0.0, 0.2, 0.0), Vec3::splat(0.5), &t));
++        assert!(!tri_box_overlap(Vec3::new(0.0, 0.7, 0.0), Vec3::splat(0.5), &t));
++        assert!(!tri_box_overlap(Vec3::new(3.0, 0.0, 0.0), Vec3::splat(0.5), &t));
++    }
++
++    #[test]
++    fn the_land_height_is_interpolated() {
++        let t = [Vec3::new(0.0, 0.0, 0.0), Vec3::new(8.0, 8.0, 0.0), Vec3::new(0.0, 0.0, 8.0)];
++        assert!((height_at(&t, 4.0, 1.0).unwrap() - 4.0).abs() < 1e-4);
++        assert!(height_at(&t, 7.0, 7.0).is_none(), "outside its top view");
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/mod.rs b/crates/benilla-app/src/wowcraft/mod.rs
+index cd556dcc..06467785 100644
+--- a/crates/benilla-app/src/wowcraft/mod.rs
++++ b/crates/benilla-app/src/wowcraft/mod.rs
+@@ -16,9 +16,14 @@
+ //! ours (`Player::face_yaw`, the camera's) is 0 facing −Z, so one is π minus the other. Its pitch
+ //! looks down where ours looks up.
+ 
++pub(crate) mod account;
++pub(crate) mod blocks;
++pub(crate) mod collision;
+ pub(crate) mod input;
++pub(crate) mod overlay;
+ 
+ use std::path::PathBuf;
++use std::sync::Arc;
+ 
+ use bevy::prelude::*;
+ use bevy::window::PrimaryWindow;
+@@ -51,7 +56,12 @@ impl Plugin for WowCraftPlugin {
+             }
+         };
+         info!("wowcraft: link up (pid {}), waiting for Minecraft", std::process::id());
+-        app.insert_resource(WowCraft::new(link))
++        let link = Arc::new(link);
++        account::plugin(app);
++        collision::plugin(app, link.clone());
++        overlay::plugin(app);
++        blocks::plugin(app);
++        app.insert_resource(WowCraft::new(link.clone()))
+             .add_systems(
+                 PreUpdate,
+                 tick_link.after(bevy::input::InputSystems),
+@@ -132,7 +142,7 @@ pub(crate) struct Drive {
+ 
+ #[derive(Resource)]
+ pub(crate) struct WowCraft {
+-    pub(crate) link: Link,
++    pub(crate) link: Arc<Link>,
+     /// Minecraft's last state, while it's alive.
+     pub(crate) mc: Option<McState>,
+     /// The Minecraft process we last saw, so a restart resets the overlay swap.
+@@ -161,7 +171,7 @@ pub(crate) struct WowCraft {
+ }
+ 
+ impl WowCraft {
+-    fn new(link: Link) -> Self {
++    fn new(link: Arc<Link>) -> Self {
+         WowCraft {
+             link,
+             mc: None,
+@@ -181,6 +191,11 @@ impl WowCraft {
+         }
+     }
+ 
++    /// The collision epoch Minecraft is on: it drops every region when this changes.
++    pub(crate) fn collision_epoch(&self) -> u32 {
++        self.collision_epoch
++    }
++
+     /// Minecraft is there and in its world.
+     pub(crate) fn mc_in_world(&self) -> bool {
+         self.mc.is_some_and(|m| m.flags & MC_IN_WORLD != 0)
+diff --git a/crates/benilla-app/src/wowcraft/overlay.rs b/crates/benilla-app/src/wowcraft/overlay.rs
+new file mode 100644
+index 00000000..3673b4ad
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/overlay.rs
+@@ -0,0 +1,100 @@
++//! Minecraft's own screen over WoW's: its hotbar, hearts and hunger, crosshair, first-person hand,
++//! chat and every screen it opens (the inventory, a chest, its menu). The mod reads Minecraft's
++//! frame back each frame (transparent where its world would be, premultiplied, bottom-up rows) at
++//! our window's pixel size, and publishes it through the overlay triple buffer; here it becomes one
++//! quad over the whole window, painted after all of WoW's interface in the player-UI pass.
++
++use bevy::asset::RenderAssetUsages;
++use bevy::math::Rect;
++use bevy::prelude::*;
++use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
++use bevy::window::PrimaryWindow;
++
++use super::WowCraft;
++use crate::char_select::ClientState;
++use crate::ui_pass::{UiQuad, UiQuads};
++
++pub(crate) fn plugin(app: &mut App) {
++    app.init_resource::<Overlay>().add_systems(
++        Update,
++        (take_frame, show_frame.in_set(crate::ui_pass::UiQuadAppend)).chain(),
++    );
++}
++
++#[derive(Resource, Default)]
++struct Overlay {
++    image: Option<Handle<Image>>,
++    size: UVec2,
++    /// A frame arrived since Minecraft (re)joined its world.
++    ready: bool,
++}
++
++/// The newest published frame, into our texture.
++fn take_frame(wc: Res<WowCraft>, mut overlay: ResMut<Overlay>, mut images: ResMut<Assets<Image>>) {
++    if !wc.mc_in_world() {
++        overlay.ready = false;
++        return;
++    }
++    if !wc.link.acquire_overlay() {
++        return;
++    }
++    let (header, pixels) = wc.link.overlay_front();
++    let (w, h) = (header.width, header.height);
++    if w == 0 || h == 0 || pixels.len() < (w * h * 4) as usize {
++        return;
++    }
++    let size = UVec2::new(w, h);
++    if overlay.image.is_none() || overlay.size != size {
++        let image = Image::new_fill(
++            Extent3d { width: w, height: h, depth_or_array_layers: 1 },
++            TextureDimension::D2,
++            &[0, 0, 0, 0],
++            // Minecraft's frame is display bytes, as a BLP is: decoded on sampling like the UI's.
++            TextureFormat::Rgba8UnormSrgb,
++            RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
++        );
++        overlay.image = Some(images.add(image));
++        overlay.size = size;
++    }
++    let Some(image) = overlay.image.as_ref().and_then(|h| images.get_mut(h)) else {
++        return;
++    };
++    let row = (w * 4) as usize;
++    let data = image.data.get_or_insert_with(Vec::new);
++    data.resize(row * h as usize, 0);
++    if header.flags & 1 != 0 {
++        // Read back from the GPU's origin, bottom row first: flipped into ours, top first.
++        for y in 0..h as usize {
++            let src = (h as usize - 1 - y) * row;
++            data[y * row..(y + 1) * row].copy_from_slice(&pixels[src..src + row]);
++        }
++    } else {
++        data.copy_from_slice(&pixels[..row * h as usize]);
++    }
++    overlay.ready = true;
++}
++
++/// Over every WoW frame: the append lane's quads sort with the interface's, and this one's key is
++/// the highest.
++fn show_frame(
++    overlay: Res<Overlay>,
++    wc: Res<WowCraft>,
++    state: Res<State<ClientState>>,
++    window: Query<&Window, With<PrimaryWindow>>,
++    mut quads: ResMut<UiQuads>,
++) {
++    if !overlay.ready || !wc.mc_in_world() || *state.get() != ClientState::InWorld {
++        return;
++    }
++    let (Some(image), Ok(window)) = (overlay.image.as_ref(), window.single()) else {
++        return;
++    };
++    quads.overlays.push(UiQuad {
++        rect: Rect::new(0.0, 0.0, window.width(), window.height()),
++        z_key: u64::MAX,
++        texture: Some(image.clone()),
++        // Drawn over a transparent clear with straight-alpha blending: the bytes are premultiplied.
++        premultiplied: true,
++        ..default()
++    });
++}
+diff --git a/crates/benilla-world/src/collision.rs b/crates/benilla-world/src/collision.rs
+index fcbb5f59..d4033e63 100644
+--- a/crates/benilla-world/src/collision.rs
++++ b/crates/benilla-world/src/collision.rs
+@@ -94,6 +94,11 @@ pub(crate) fn track_collider_removals(
+ #[derive(Component)]
+ pub struct GroundDecalSurface;
+ 
++/// Marks a terrain tile's collider (the land itself, not a building or a doodad), for a crate on
++/// top that needs to tell the ground from what stands on it (WowCraft's export to Minecraft).
++#[derive(Component)]
++pub struct TerrainSurface;
++
+ /// Marks a static collider that occludes the mouse pick: the reference traces the world too and
+ /// drops the object hit when the world hit is strictly nearer (`0x480df0` at `0x480eb4`,
+ /// `CWorld::Intersect` `0x672170`, mask `0x1000114`), so a unit behind a wall is not hoverable.
+diff --git a/crates/benilla-world/src/terrain_stream.rs b/crates/benilla-world/src/terrain_stream.rs
+index b6ecaf8e..a60dd3f4 100644
+--- a/crates/benilla-world/src/terrain_stream.rs
++++ b/crates/benilla-world/src/terrain_stream.rs
+@@ -13,7 +13,7 @@ use bevy::prelude::*;
+ use bevy::render::render_resource::Face;
+ 
+ use crate::clutter::{scatter_tile_clutter, ClutterConfig, GroundClutter};
+-use crate::collision::{walk_layers, GroundDecalSurface, PickOccluder};
++use crate::collision::{walk_layers, GroundDecalSurface, PickOccluder, TerrainSurface};
+ use crate::interior::WmoResidency;
+ use crate::lighting::SharedLightBuffer;
+ use crate::liquid::{spawn_liquids, LiquidAssets};
+@@ -729,6 +729,7 @@ fn stream_terrain(
+                 PendingCollider::new(build_collider_task(verts, tris), None, true),
+                 GroundDecalSurface,
+                 PickOccluder,
++                TerrainSurface,
+             ));
+         }
+         tile.entity = Some(tile_ent.id());
+diff --git a/crates/wowcraft-link/src/link.rs b/crates/wowcraft-link/src/link.rs
+index c1b55d12..91f408e9 100644
+--- a/crates/wowcraft-link/src/link.rs
++++ b/crates/wowcraft-link/src/link.rs
+@@ -40,7 +40,7 @@ pub fn shm_name(base: &str) -> String {
+ pub struct Link {
+     base: *mut u8,
+     /// The overlay slot we read (Minecraft writes into its private back slot, starting at 1).
+-    overlay_front: u32,
++    overlay_front: AtomicU32,
+ }
+ 
+ // SAFETY: every access to the mapping goes through atomics or is ordered by the seqlocks and ring
+@@ -73,7 +73,7 @@ impl Link {
+         })?;
+         let link = Link {
+             base,
+-            overlay_front: 2,
++            overlay_front: AtomicU32::new(2),
+         };
+         link.reset();
+         Ok(link)
+@@ -370,24 +370,24 @@ impl Link {
+     // ---- overlay triple buffer (we consume) ---------------------------------------------------
+ 
+     /// Swaps a newer frame into our front slot, if Minecraft published one.
+-    pub fn acquire_overlay(&mut self) -> bool {
++    pub fn acquire_overlay(&self) -> bool {
+         let state = self.u32_at(OFF_OVERLAY_CTL + OC_STATE);
+         if state.load(Ordering::Acquire) & OVERLAY_DIRTY == 0 {
+             return false;
+         }
+-        let old = state.swap(self.overlay_front, Ordering::AcqRel);
+-        self.overlay_front = old & 3;
++        let old = state.swap(self.overlay_front.load(Ordering::Relaxed), Ordering::AcqRel);
++        self.overlay_front.store(old & 3, Ordering::Relaxed);
+         true
+     }
+ 
+     /// Minecraft (re)connected: its writer starts again at slot 1.
+-    pub fn reset_overlay(&mut self) {
++    pub fn reset_overlay(&self) {
+         self.u32_at(OFF_OVERLAY_CTL + OC_STATE).store(0, Ordering::Release);
+-        self.overlay_front = 2;
++        self.overlay_front.store(2, Ordering::Relaxed);
+     }
+ 
+     pub fn overlay_front(&self) -> (OverlaySlotHdr, &[u8]) {
+-        let slot = (self.overlay_front as usize).min(OVERLAY_SLOTS - 1);
++        let slot = (self.overlay_front.load(Ordering::Relaxed) as usize).min(OVERLAY_SLOTS - 1);
+         let header: OverlaySlotHdr = self.read(OFF_OVERLAY_SLOT_HDR + slot * SLOT_HDR_BYTES);
+         let w = header.width.min(MAX_OVERLAY_W) as usize;
+         let h = header.height.min(MAX_OVERLAY_H) as usize;
+@@ -418,7 +418,7 @@ mod tests {
+         // SAFETY: as `Link::create`.
+         unsafe { libc::shm_unlink(name.as_ptr()) };
+         let base = Link::map(&name).expect("map");
+-        let link = Link { base, overlay_front: 2 };
++        let link = Link { base, overlay_front: AtomicU32::new(2) };
+         link.reset();
+         TestLink { link, name }
+     }
+@@ -509,7 +509,7 @@ mod tests {
+ 
+     #[test]
+     fn the_overlay_swaps_only_when_minecraft_published() {
+-        let mut t = test_link("ovl");
++        let t = test_link("ovl");
+         assert!(!t.link.acquire_overlay(), "nothing published");
+         // Minecraft published slot 1.
+         t.link.u32_at(OFF_OVERLAY_CTL).store(1 | OVERLAY_DIRTY, Ordering::Release);
+-- 
+2.50.1 (Apple Git-155)
+

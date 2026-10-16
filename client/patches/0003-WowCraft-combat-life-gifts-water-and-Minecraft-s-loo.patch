@@ -1,0 +1,1902 @@
+From 6ffc2fe723789e73629e44c40b539cacb06b0991 Mon Sep 17 00:00:00 2001
+From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:27:36 +0200
+Subject: [PATCH 3/3] WowCraft: combat, life, gifts, water and Minecraft's
+ loose things
+
+- combat: WoW's units round us as Minecraft's actor table (hittable stand-ins; friendly ones
+  unhittable; innkeepers and general goods vendors as block traders), ore veins, herbs and
+  stations as Minecraft nodes; a Minecraft hit as GM `.damage`, scaled by level and health;
+  WoW's melee, spells, ticks and lava as Minecraft damage; WoW's own auto-attack stopped; kill
+  loot by creature kind
+- life: god mode and GM mode off on entering the world; Minecraft's death as ours, the spirit
+  released and revived at the graveyard
+- gifts: each character's Minecraft inventory, quest rewards (emeralds, gear for our level,
+  food, experience), experience as orbs where the kill fell
+- water: WoW's water and lava under our feet as Minecraft's
+- blocks: dropped items, arrows, cracks, the fishing line and the block outline drawn in WoW
+- the view follows Minecraft's field of view, and farclip 500 while flying
+- WoW's interface under WowCraft: action bars, Log Out, the cinematic, tutorials, the name
+- a stale Minecraft state from an earlier game is dropped, and teleports are numbered per game
+- the chat leaves out the answers to the module's own GM commands
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/benilla-app/src/char_create/mod.rs |  11 +
+ crates/benilla-app/src/tutorial.rs        |  10 +
+ crates/benilla-app/src/ui_chat/net.rs     |   7 +
+ crates/benilla-app/src/ui_logout.rs       |   7 +
+ crates/benilla-app/src/wowcraft/blocks.rs | 140 +++-
+ crates/benilla-app/src/wowcraft/combat.rs | 809 ++++++++++++++++++++++
+ crates/benilla-app/src/wowcraft/gifts.rs  | 234 +++++++
+ crates/benilla-app/src/wowcraft/input.rs  |   7 +-
+ crates/benilla-app/src/wowcraft/life.rs   | 131 ++++
+ crates/benilla-app/src/wowcraft/mod.rs    |  68 +-
+ crates/benilla-app/src/wowcraft/ui.rs     | 144 ++++
+ crates/benilla-app/src/wowcraft/water.rs  |  90 +++
+ crates/wowcraft-link/src/link.rs          |   5 +
+ 13 files changed, 1656 insertions(+), 7 deletions(-)
+ create mode 100644 crates/benilla-app/src/wowcraft/combat.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/gifts.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/life.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/ui.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/water.rs
+
+diff --git a/crates/benilla-app/src/char_create/mod.rs b/crates/benilla-app/src/char_create/mod.rs
+index b0d89aa5..810d212d 100644
+--- a/crates/benilla-app/src/char_create/mod.rs
++++ b/crates/benilla-app/src/char_create/mod.rs
+@@ -218,6 +218,17 @@ pub(crate) struct CreateSelection {
+     creating: bool,
+ }
+ 
++impl CreateSelection {
++    /// WowCraft: a name offered for the new character, into an empty field only; true if taken.
++    pub(crate) fn prefill_name(&mut self, name: &str) -> bool {
++        if !self.name.text.is_empty() {
++            return false;
++        }
++        self.name.set_text(name);
++        true
++    }
++}
++
+ /// The five dial counts for a (race, sex), or `[1; 5]` without the catalog.
+ fn dial_counts(catalog: Option<&CharCreate>, race: u8, sex: u8) -> [u8; 5] {
+     catalog
+diff --git a/crates/benilla-app/src/tutorial.rs b/crates/benilla-app/src/tutorial.rs
+index bbf1eb0a..faa1130f 100644
+--- a/crates/benilla-app/src/tutorial.rs
++++ b/crates/benilla-app/src/tutorial.rs
+@@ -191,6 +191,16 @@ impl Tutorials {
+         self.sends.push(TutorialSend::Flag(id));
+     }
+ 
++    /// WowCraft: every tip seen at once, as `ClearTutorials()` does.
++    pub(crate) fn clear_all(&mut self) {
++        self.clear();
++    }
++
++    /// The world session's tutorial flags have landed (`SMSG_TUTORIAL_FLAGS`).
++    pub(crate) fn flags_known(&self) -> bool {
++        self.fire_once.is_some()
++    }
++
+     /// `ClearTutorials()`: the timers flushed, every bit of both banks set, the empty clear sent.
+     fn clear(&mut self) {
+         self.timers.clear();
+diff --git a/crates/benilla-app/src/ui_chat/net.rs b/crates/benilla-app/src/ui_chat/net.rs
+index 04ed774a..aa16d42a 100644
+--- a/crates/benilla-app/src/ui_chat/net.rs
++++ b/crates/benilla-app/src/ui_chat/net.rs
+@@ -131,6 +131,10 @@ fn chat(
+     net_commands: &NetCommands,
+     server_said: &mut MessageWriter<ServerSaidMessage>,
+ ) {
++    // WowCraft's own GM commands answer as system lines; they aren't the player's to read.
++    if m.chat_type == 0x0A && crate::wowcraft::quiet(&m.text) {
++        return;
++    }
+     // Addon traffic: 1.12 has no addon opcode or chat type, so `LANG_ADDON` on any lane is the
+     // whole test (`0x49a89e`, in the display function `0x49a870`). The line never renders
+     // (`0x49a970`); it fires `CHAT_MSG_ADDON` once the sender's name resolves (`0x49d7ba`,
+@@ -214,6 +218,9 @@ fn chat_wrong_faction(errors: &mut crate::ui_action::UiErrorKeys) {
+ /// `UI_ERROR_MESSAGE` from `0x4945b0(text, 1)`, never a chat line. vmangos sends `.gm on` as both
+ /// a system line and a notification (`Objects/Player.cpp:2676-2677`).
+ fn notification(text: String, errors: &mut UiErrorTexts) {
++    if crate::wowcraft::quiet(&text) {
++        return;
++    }
+     // The reference also logs it to the console (`0x63cd00`).
+     info!("net: notification — {text}");
+     errors.error(text);
+diff --git a/crates/benilla-app/src/ui_logout.rs b/crates/benilla-app/src/ui_logout.rs
+index 0c6cc6e9..41162704 100644
+--- a/crates/benilla-app/src/ui_logout.rs
++++ b/crates/benilla-app/src/ui_logout.rs
+@@ -130,6 +130,13 @@ pub(crate) fn drain_logout(
+                 if logout.pending {
+                     continue;
+                 }
++                // WowCraft: Minecraft plays along, so the character never camps alone; the
++                // launcher's Stop closes both. Quitting the game still quits.
++                if request == SessionRequest::Logout && crate::wowcraft::enabled() {
++                    info!("logout: refused under WowCraft");
++                    let _ = script.run_chunk(crate::wowcraft::ui::LOGOUT_REFUSED.as_bytes());
++                    continue;
++                }
+                 logout.quitting = request == SessionRequest::Quit;
+                 // No world session: a quit just exits, as the reference's glue-screen `Quit()`
+                 // does, and a logout does nothing.
+diff --git a/crates/benilla-app/src/wowcraft/blocks.rs b/crates/benilla-app/src/wowcraft/blocks.rs
+index ababb427..b143085a 100644
+--- a/crates/benilla-app/src/wowcraft/blocks.rs
++++ b/crates/benilla-app/src/wowcraft/blocks.rs
+@@ -27,7 +27,7 @@ const BUDGET: usize = 24 << 20;
+ pub(crate) fn plugin(app: &mut App) {
+     app.init_resource::<Scene>().add_systems(
+         Update,
+-        (drain_render, place_avatar, hide_wow_body).chain().after(crate::player::PlayerControlSet),
++        (drain_render, place_avatar, hide_wow_body, draw_world_entities).chain().after(crate::player::PlayerControlSet),
+     );
+ }
+ 
+@@ -57,6 +57,8 @@ struct Scene {
+     scene_root: Option<Entity>,
+     scene: Pool,
+     avatar_shown: bool,
++    /// Minecraft's loose things (items, arrows, cracks), one mesh rebuilt each frame.
++    loose: Option<(Entity, Handle<Mesh>)>,
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -281,6 +283,139 @@ fn material(scene: &mut Scene, materials: &mut Assets<StandardMaterial>, look: L
+     m
+ }
+ 
++/// Minecraft's loose things, from its world entity table each frame: dropped items (as sprites
++/// facing us, or little cubes for blocks), arrows, a block being mined's cracks, the fishing line,
++/// and the outline of the block Minecraft's crosshair is on, which its own frame (the overlay)
++/// doesn't draw.
++#[allow(clippy::too_many_arguments)]
++fn draw_world_entities(
++    wc: Res<WowCraft>,
++    mut scene: ResMut<Scene>,
++    mut commands: Commands,
++    mut meshes: ResMut<Assets<Mesh>>,
++    mut materials: ResMut<Assets<StandardMaterial>>,
++    camera: Query<&GlobalTransform, With<benilla_world::view::WorldCamera>>,
++    mut visibility: Query<&mut Visibility>,
++    mut gizmos: Gizmos,
++) {
++    let table = if wc.mc_in_world() { wc.link.read_world_entities() } else { None };
++    let Some((header, list)) = table else {
++        if let Some((e, _)) = scene.loose {
++            if let Ok(mut v) = visibility.get_mut(e) {
++                *v = Visibility::Hidden;
++            }
++        }
++        return;
++    };
++    if header.has_selection != 0 {
++        let (lo, hi) = (Vec3::from(header.sel_min), Vec3::from(header.sel_max));
++        let t = Transform::from_translation((lo + hi) * 0.5).with_scale(hi - lo + Vec3::splat(0.004));
++        gizmos.cube(t, Color::srgba(0.0, 0.0, 0.0, 0.7));
++    }
++    let eye = camera.single().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
++    let mut quads = Quads::default();
++    for e in &list {
++        let p = Vec3::from(e.pos);
++        match e.kind {
++            WE_ITEM => {
++                let h = e.scale.max(0.1) * 0.5;
++                let mut to_eye = eye - p;
++                to_eye.y = 0.0;
++                let right = Vec3::Y.cross(to_eye.normalize_or(Vec3::Z)).normalize_or(Vec3::X) * h;
++                let up = Vec3::Y * h;
++                quads.push([p - right + up, p + right + up, p + right - up, p - right - up], e.uv[0]);
++            }
++            WE_BLOCK => {
++                let h = e.scale.max(0.05) * 0.5;
++                let rot = Quat::from_rotation_y((-e.yaw).to_radians());
++                // Faces: north's sprite round the sides, then up and down.
++                quads.cube(p, Vec3::splat(h), rot, [e.uv[0], e.uv[1], e.uv[2]]);
++            }
++            WE_CRACK => {
++                let ext = Vec3::from(e.ext);
++                quads.cube(p + ext * 0.5, ext * 0.5, Quat::IDENTITY, [e.uv[0]; 3]);
++            }
++            WE_ARROW | WE_TRIDENT => {
++                let (yaw, pitch) = (e.yaw.to_radians(), e.pitch.to_radians());
++                let d = Vec3::new(-yaw.sin() * pitch.cos(), -pitch.sin(), yaw.cos() * pitch.cos()).normalize_or(Vec3::Z);
++                let side = d.cross(Vec3::Y).normalize_or(Vec3::X);
++                let up = side.cross(d);
++                let (half, w) = (0.25 * e.scale.max(0.5), 0.06);
++                let (a, b) = (p - d * half, p + d * half);
++                quads.push([a + up * w, b + up * w, b - up * w, a - up * w], e.uv[0]);
++                quads.push([a + side * w, b + side * w, b - side * w, a - side * w], e.uv[0]);
++            }
++            WE_LINE => gizmos.line(p, Vec3::from(e.ext), Color::srgba(0.1, 0.1, 0.1, 0.8)),
++            _ => {}
++        }
++    }
++    let mesh = quads.mesh();
++    match scene.loose.clone() {
++        Some((e, handle)) => {
++            let _ = meshes.insert(&handle, mesh);
++            if let Ok(mut v) = visibility.get_mut(e) {
++                let want = if quads.is_empty() { Visibility::Hidden } else { Visibility::Visible };
++                if *v != want {
++                    *v = want;
++                }
++            }
++        }
++        None => {
++            let handle = meshes.add(mesh);
++            let mat = material(&mut scene, &mut materials, Look { texture: 0, translucent: false });
++            let e = commands.spawn((Name::new("wowcraft loose things"), Mesh3d(handle.clone()), MeshMaterial3d(mat), Transform::default())).id();
++            scene.loose = Some((e, handle));
++        }
++    }
++}
++
++/// Textured quads on the atlas, built up into one mesh.
++#[derive(Default)]
++struct Quads {
++    pos: Vec<[f32; 3]>,
++    uv: Vec<[f32; 2]>,
++    nrm: Vec<[f32; 3]>,
++}
++
++impl Quads {
++    fn is_empty(&self) -> bool {
++        self.pos.is_empty()
++    }
++
++    /// Corners from the top left, clockwise as seen; `rect` is the sprite's u0, v0, u1, v1.
++    fn push(&mut self, c: [Vec3; 4], rect: [f32; 4]) {
++        let [u0, v0, u1, v1] = rect;
++        let uv = [[u0, v0], [u1, v0], [u1, v1], [u0, v1]];
++        let n = (c[1] - c[0]).cross(c[3] - c[0]).normalize_or(Vec3::Y).to_array();
++        for i in [0, 1, 2, 0, 2, 3] {
++            self.pos.push(c[i].to_array());
++            self.uv.push(uv[i]);
++            self.nrm.push(n);
++        }
++    }
++
++    /// A box round `centre`: the sides take `faces[0]`, the top `faces[1]`, the bottom `faces[2]`.
++    fn cube(&mut self, centre: Vec3, half: Vec3, rot: Quat, faces: [[f32; 4]; 3]) {
++        let at = |x: f32, y: f32, z: f32| centre + rot * Vec3::new(x * half.x, y * half.y, z * half.z);
++        // North, east, south, west, each from its top left seen from outside.
++        self.push([at(1.0, 1.0, -1.0), at(-1.0, 1.0, -1.0), at(-1.0, -1.0, -1.0), at(1.0, -1.0, -1.0)], faces[0]);
++        self.push([at(1.0, 1.0, 1.0), at(1.0, 1.0, -1.0), at(1.0, -1.0, -1.0), at(1.0, -1.0, 1.0)], faces[0]);
++        self.push([at(-1.0, 1.0, 1.0), at(1.0, 1.0, 1.0), at(1.0, -1.0, 1.0), at(-1.0, -1.0, 1.0)], faces[0]);
++        self.push([at(-1.0, 1.0, -1.0), at(-1.0, 1.0, 1.0), at(-1.0, -1.0, 1.0), at(-1.0, -1.0, -1.0)], faces[0]);
++        self.push([at(-1.0, 1.0, -1.0), at(1.0, 1.0, -1.0), at(1.0, 1.0, 1.0), at(-1.0, 1.0, 1.0)], faces[1]);
++        self.push([at(-1.0, -1.0, 1.0), at(1.0, -1.0, 1.0), at(1.0, -1.0, -1.0), at(-1.0, -1.0, -1.0)], faces[2]);
++    }
++
++    fn mesh(&self) -> Mesh {
++        let n = self.pos.len();
++        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
++            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.pos.clone())
++            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.nrm.clone())
++            .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, self.uv.clone())
++            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, vec![[0.9f32, 0.9, 0.9, 1.0]; n])
++    }
++}
++
+ /// A message's fixed header and what follows it.
+ fn split<T: bytemuck::Pod>(payload: &[u8]) -> Option<(T, &[u8])> {
+     let n = std::mem::size_of::<T>();
+@@ -397,7 +532,8 @@ mod tests {
+     fn light_follows_minecrafts_curve() {
+         assert_eq!(brightness(15), 1.0);
+         assert_eq!(brightness(0), 0.0);
+-        assert!((brightness(8) - 0.2286).abs() < 1e-3, "{}", brightness(8));
++        // 8/15 over 4 - 3·8/15.
++        assert!((brightness(8) - 0.2222).abs() < 1e-3, "{}", brightness(8));
+     }
+ 
+     #[test]
+diff --git a/crates/benilla-app/src/wowcraft/combat.rs b/crates/benilla-app/src/wowcraft/combat.rs
+new file mode 100644
+index 00000000..bcf7d9ed
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/combat.rs
+@@ -0,0 +1,809 @@
++//! Fighting WoW's creatures with Minecraft's weapons, both ways:
++//! - every unit near us goes to Minecraft's actor table (20 times a second) as a hittable stand-in,
++//!   friendly ones unhittable and innkeepers and general goods vendors as block traders;
++//! - a Minecraft hit on one (`EV_HIT_ACTOR`) selects it and deals WoW damage by GM `.damage`,
++//!   scaled by its level and health, and WoW's own auto-attack is stopped, so the swing is
++//!   Minecraft's;
++//! - whatever WoW hits us for (melee, spells, their ticks, lava, fire) hurts Minecraft's player
++//!   (`IN_HURT`), scaled to our health: Minecraft's hearts are our life ([`super::life`]);
++//! - ore veins, herbs, anvils, forges, cooking fires, mailboxes and chests are nodes Minecraft
++//!   places as its own blocks; one mined there is hidden here a while (`EV_ORE_MINED`);
++//! - a creature we fought that dies drops Minecraft loot where it fell.
++
++use std::collections::{HashMap, HashSet};
++
++use benilla_protocol::guid;
++use benilla_protocol::messages::PeriodicTick;
++use benilla_protocol::{SessionEvent, SessionEventKind};
++use bevy::prelude::*;
++
++use wowcraft_link::proto::*;
++
++use super::WowCraft;
++use crate::char_select::ClientState;
++use crate::entities::CollisionHeight;
++use crate::names::NameCache;
++use crate::net::{ClientCommand, Guid, GuidIndex, NetCommands, NetHandlerApp, ObjectStore, Reputations, SelfGuid, SelfPlayer};
++use crate::player::Player;
++
++/// How far round us units and nodes go to Minecraft (its stand-ins live in loaded chunks only).
++const ACTOR_RANGE: f32 = 64.0;
++/// The table's refresh: Minecraft's own tick.
++const ACTOR_PERIOD: f32 = 0.05;
++/// A node mined in Minecraft stays hidden here, and out of the table, this long.
++const TAKEN_SECS: f32 = 300.0;
++/// A unit we hit counts as our fight this long: its death is our kill.
++const FIGHT_SECS: f32 = 60.0;
++
++pub(crate) fn plugin(app: &mut App) {
++    use SessionEventKind as K;
++    app.init_resource::<FormIds>()
++        .init_resource::<Fights>()
++        .add_systems(
++            Update,
++            (publish_actors, apply_hits, kill_loot).chain().run_if(in_world),
++        )
++        .add_systems(PostUpdate, hide_taken_nodes.before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate))
++        .net_handler(K::AttackerState, on_attacker_state)
++        .net_handler(K::SpellDamageLog, on_spell_damage)
++        .net_handler(K::PeriodicAuraLog, on_periodic_damage)
++        .net_handler(K::EnvironmentalDamageLog, on_environmental_damage)
++        .net_handler(K::AttackStart, on_attack_start);
++}
++
++fn in_world(state: Res<State<ClientState>>, wc: Res<WowCraft>) -> bool {
++    *state.get() == ClientState::InWorld && wc.mc_in_world()
++}
++
++/// The ids Minecraft knows our units and nodes by: a guid is 64 bits, a form id 32. Never 0,
++/// which is "no attacker".
++#[derive(Resource, Default)]
++pub(crate) struct FormIds {
++    by_guid: HashMap<u64, u32>,
++    by_id: HashMap<u32, u64>,
++    next: u32,
++}
++
++impl FormIds {
++    pub(crate) fn id(&mut self, guid: u64) -> u32 {
++        if let Some(&id) = self.by_guid.get(&guid) {
++            return id;
++        }
++        self.next = self.next.wrapping_add(1).max(1);
++        let id = self.next;
++        self.by_guid.insert(guid, id);
++        self.by_id.insert(id, guid);
++        id
++    }
++
++    pub(crate) fn peek(&self, guid: u64) -> Option<u32> {
++        self.by_guid.get(&guid).copied()
++    }
++
++    pub(crate) fn guid(&self, id: u32) -> Option<u64> {
++        self.by_id.get(&id).copied()
++    }
++}
++
++/// Who we've been fighting, and which nodes Minecraft has taken.
++#[derive(Resource, Default)]
++pub(crate) struct Fights {
++    /// Guid to when we last hit it.
++    hit: HashMap<u64, f32>,
++    /// Kills already looted.
++    looted: HashSet<u64>,
++    /// WoW's word that we killed these (an XP award names the victim).
++    pub(crate) kills: Vec<u64>,
++    /// Node guid to when it comes back.
++    taken: HashMap<u64, f32>,
++}
++
++/// A node Minecraft places as its own block: `kind` is the mod's `OreNodes.KINDS` index, `size`
++/// the volume it fills (x, y, z yards).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) struct Node {
++    pub(crate) kind: u16,
++    pub(crate) size: [f32; 3],
++}
++
++const ORES: &[(&str, u16)] = &[
++    ("copper vein", 0),
++    ("tin vein", 1),
++    ("iron deposit", 2),
++    ("silver vein", 3),
++    ("gold vein", 4),
++    ("mithril deposit", 5),
++    ("truesilver deposit", 6),
++    ("thorium vein", 7),
++    ("dark iron deposit", 8),
++    ("incendicite", 5),
++    ("bloodstone", 5),
++    ("indurium", 2),
++];
++
++/// Herbs as Minecraft flowers, by look (kinds 9 to 27: poppy, azure bluet, allium, cornflower,
++/// oxeye daisy, brown mushroom, red tulip, lily of the valley, dandelion, blue orchid, white
++/// tulip, orange tulip, wither rose, dead bush, crimson fungus, red mushroom, pink tulip,
++/// torchflower, fern).
++const HERBS: &[(&str, u16)] = &[
++    ("briarthorn", 9),
++    ("silverleaf", 10),
++    ("silversage", 10),
++    ("bruiseweed", 11),
++    ("purple lotus", 11),
++    ("dreamfoil", 12),
++    ("peacebloom", 13),
++    ("grave moss", 14),
++    ("kingsblood", 15),
++    ("fadeleaf", 16),
++    ("mageroyal", 17),
++    ("sungrass", 17),
++    ("wintersbite", 18),
++    ("icecap", 18),
++    ("steelbloom", 19),
++    ("goldthorn", 20),
++    ("golden sansam", 20),
++    ("arthas' tears", 21),
++    ("plaguebloom", 21),
++    ("black lotus", 21),
++    ("earthroot", 22),
++    ("liferoot", 22),
++    ("gromsblood", 23),
++    ("ghost mushroom", 24),
++    ("khadgar's whisker", 25),
++    ("firebloom", 26),
++    ("stranglekelp", 27),
++    ("blindweed", 27),
++];
++
++/// What a GameObject is to Minecraft, by its name.
++pub(crate) fn node_of(name: &str) -> Option<Node> {
++    let n = name.to_ascii_lowercase();
++    if let Some(&(_, kind)) = ORES.iter().find(|(k, _)| n.contains(k)) {
++        return Some(Node { kind, size: [2.0, 1.5, 2.0] });
++    }
++    if let Some(&(_, kind)) = HERBS.iter().find(|(k, _)| n.contains(k)) {
++        return Some(Node { kind, size: [1.0, 1.0, 1.0] });
++    }
++    let station = |kind, size| Some(Node { kind, size });
++    if n.contains("anvil") {
++        return station(28, [1.0, 1.0, 1.0]);
++    }
++    if n.contains("forge") {
++        return station(29, [2.0, 2.0, 2.0]);
++    }
++    if n.contains("cooking") || n.contains("campfire") || n.contains("bonfire") {
++        return station(30, [1.0, 1.0, 1.0]);
++    }
++    if n.contains("mailbox") {
++        return station(31, [1.0, 1.0, 1.0]);
++    }
++    if n.contains("chest") || n.contains("footlocker") || n.contains("strongbox") {
++        return station(32, [1.0, 1.0, 1.0]);
++    }
++    None
++}
++
++/// NPC flags (vmangos `UNIT_NPC_FLAG_*`).
++const NPC_VENDOR: u32 = 0x4;
++const NPC_INNKEEPER: u32 = 0x80;
++/// `UNIT_FLAG_IN_COMBAT`.
++const UNIT_IN_COMBAT: u32 = 0x8_0000;
++/// `UNIT_FLAG_NON_ATTACKABLE`, `UNIT_FLAG_NOT_SELECTABLE`.
++const UNIT_UNHITTABLE: u32 = 0x2 | 0x200_0000;
++
++/// Innkeepers and general goods vendors trade blocks.
++fn is_trader(npc_flags: u32, subname: Option<&str>) -> bool {
++    if npc_flags & NPC_INNKEEPER != 0 {
++        return true;
++    }
++    npc_flags & NPC_VENDOR != 0
++        && subname.is_some_and(|s| {
++            let s = s.to_ascii_lowercase();
++            s.contains("general") || s.contains("goods") || s.contains("supplies")
++        })
++}
++
++/// A name as the record's 24 bytes, cut on a character boundary.
++fn name_bytes(name: &str) -> [u8; 24] {
++    let mut out = [0u8; 24];
++    let mut end = name.len().min(23);
++    while !name.is_char_boundary(end) {
++        end -= 1;
++    }
++    out[..end].copy_from_slice(&name.as_bytes()[..end]);
++    out
++}
++
++#[derive(bevy::ecs::system::SystemParam)]
++pub(crate) struct Around<'w, 's> {
++    objects: Query<
++        'w,
++        's,
++        (
++            Entity,
++            &'static Guid,
++            &'static ObjectStore,
++            &'static GlobalTransform,
++            Option<&'static CollisionHeight>,
++        ),
++        Without<SelfPlayer>,
++    >,
++    me: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
++    names: Res<'w, NameCache>,
++    templates: Option<Res<'w, crate::go_templates::GameObjectTemplates>>,
++    factions: Option<Res<'w, crate::target::Factions>>,
++    reputations: Res<'w, Reputations>,
++}
++
++/// Everything near us, as Minecraft's actor table.
++fn publish_actors(
++    wc: Res<WowCraft>,
++    player: Res<Player>,
++    around: Around,
++    mut ids: ResMut<FormIds>,
++    fights: Res<Fights>,
++    time: Res<Time>,
++    mut next: Local<f32>,
++    mut said: Local<f32>,
++) {
++    let now = time.elapsed_secs();
++    if now < *next {
++        return;
++    }
++    *next = now + ACTOR_PERIOD;
++    let me = around.me.single().ok();
++    let mut near: Vec<(f32, ActorRecord)> = Vec::new();
++    for (_, guid, store, at, height) in &around.objects {
++        let pos = at.translation();
++        let d = pos.distance(player.pos);
++        if d > ACTOR_RANGE {
++            continue;
++        }
++        let g = guid.0;
++        if guid::is_gameobject(g) {
++            if fights.taken.get(&g).is_some_and(|&until| now < until) {
++                continue;
++            }
++            let Some(node) = around.templates.as_ref().and_then(|t| t.get(g)).and_then(|t| node_of(&t.name)) else {
++                continue;
++            };
++            // The mod reads a node's box from its corner: x and z sizes in `width` and
++            // `health_frac`, the height in `height`.
++            near.push((
++                d,
++                ActorRecord {
++                    form_id: ids.id(g),
++                    flags: ACTOR_ORE,
++                    pos: [pos.x - node.size[0] * 0.5, pos.y, pos.z - node.size[2] * 0.5],
++                    yaw: 0.0,
++                    width: node.size[0],
++                    height: node.size[1],
++                    health_frac: node.size[2],
++                    level: node.kind,
++                    pad: 0,
++                    name: [0; 24],
++                },
++            ));
++            continue;
++        }
++        if !store.is_unit() {
++            continue;
++        }
++        let f = &store.0;
++        let reaction = crate::ui_unit::unit_reaction(around.factions.as_deref(), &around.reputations, store, me);
++        let mut flags = 0;
++        if reaction <= 3 {
++            flags |= ACTOR_HOSTILE;
++        }
++        if reaction >= 5 || f.unit_flags() & UNIT_UNHITTABLE != 0 {
++            flags |= ACTOR_FRIENDLY;
++        }
++        if f.unit_is_dead() {
++            flags |= ACTOR_DEAD;
++        }
++        if f.unit_flags() & UNIT_IN_COMBAT != 0 {
++            flags |= ACTOR_IN_COMBAT;
++        }
++        let entry = f.object_entry().unwrap_or(0);
++        if !guid::is_player(g) && is_trader(f.unit_npc_flags(), around.names.creature_subname(entry)) {
++            flags |= ACTOR_TRADER;
++        }
++        let health = f.unit_health().unwrap_or(1) as f32;
++        let max = f.unit_max_health().unwrap_or(1).max(1) as f32;
++        let scale = f.object_scale_x().filter(|s| *s > 0.0).unwrap_or(1.0);
++        let width = (f.unit_bounding_radius() * 2.0 * scale).clamp(0.6, 6.0);
++        let height = height.map_or(2.0, |h| h.0).clamp(0.5, 12.0);
++        let (yaw, _, _) = at.rotation().to_euler(EulerRot::YXZ);
++        let name = around.names.peek_unit(g, Some(store)).unwrap_or("");
++        near.push((
++            d,
++            ActorRecord {
++                form_id: ids.id(g),
++                flags,
++                pos: pos.to_array(),
++                yaw: super::mc_yaw_of(yaw),
++                width,
++                height,
++                health_frac: (health / max).clamp(0.0, 1.0),
++                level: f.unit_level().unwrap_or(1).min(u16::MAX as u32) as u16,
++                pad: 0,
++                name: name_bytes(name),
++            },
++        ));
++    }
++    near.sort_by(|a, b| a.0.total_cmp(&b.0));
++    near.truncate(MAX_ACTORS);
++    // Once in a while: what decides hostility, ours and the nearest unit's.
++    if now >= *said {
++        *said = now + 30.0;
++        if let (Some(me), Some((_, _, store, _, _))) = (me, around.objects.iter().filter(|o| o.2.is_unit()).min_by(|a, b| a.3.translation().distance(player.pos).total_cmp(&b.3.translation().distance(player.pos)))) {
++            debug!(
++                "wowcraft: our faction template {:?} (player flags {:#x}); the nearest unit's {:?} reads {}",
++                me.0.unit_faction_template(),
++                me.0.player_flags(),
++                store.0.unit_faction_template(),
++                crate::ui_unit::unit_reaction(around.factions.as_deref(), &around.reputations, store, Some(me)),
++            );
++        }
++    }
++    let records: Vec<ActorRecord> = near.into_iter().map(|(_, r)| r).collect();
++    wc.link.write_actors(&records);
++}
++
++/// WoW damage for a Minecraft hit on a creature: by its level (a stone sword, 5, takes a level-10
++/// creature in about five), and never fewer than forty of Minecraft's hearts' worth of its health,
++/// so a high-level one stays fightable.
++pub(crate) fn wow_damage(mc_damage: f32, level: u32, max_health: u32) -> u32 {
++    if mc_damage <= 0.0 {
++        return 0;
++    }
++    let by_level = mc_damage * (3.0 + 0.6 * level as f32);
++    let by_health = max_health as f32 * mc_damage / 40.0;
++    by_level.max(by_health).round().max(1.0) as u32
++}
++
++/// Minecraft damage (half hearts) for a WoW hit on us: the share of our health it would take, of
++/// Minecraft's twenty, a little harder as we level (Minecraft's armour takes its part after).
++pub(crate) fn mc_damage(wow_damage: u32, max_health: u32, level: u32) -> f32 {
++    if wow_damage == 0 {
++        return 0.0;
++    }
++    let share = wow_damage as f32 / max_health.max(1) as f32;
++    share * 20.0 * (1.25 + 0.05 * level as f32)
++}
++
++/// `IN_HURT`'s amount: the mod takes it as hundredths of a Skyrim point, five to a half heart.
++fn hurt_amount(mc: f32) -> i32 {
++    (mc * 500.0).round() as i32
++}
++
++#[derive(bevy::ecs::system::SystemParam)]
++pub(crate) struct Gm<'w> {
++    net: Option<Res<'w, NetCommands>>,
++}
++
++impl Gm<'_> {
++    /// A GM command, as WoW's chat sends one.
++    pub(crate) fn say(&self, text: &str) {
++        let Some(net) = self.net.as_ref() else { return };
++        let _ = net.0.send(ClientCommand::Chat {
++            kind: crate::net::ChatKind::Say,
++            target: None,
++            text: text.to_string(),
++            language: None,
++        });
++    }
++
++    pub(crate) fn send(&self, command: ClientCommand) {
++        if let Some(net) = self.net.as_ref() {
++            let _ = net.0.send(command);
++        }
++    }
++}
++
++/// Minecraft's hits and mined nodes.
++fn apply_hits(
++    wc: Res<WowCraft>,
++    ids: Res<FormIds>,
++    index: Res<GuidIndex>,
++    stores: Query<&ObjectStore>,
++    names: Res<NameCache>,
++    mut select: crate::target::SelectCommit,
++    gm: Gm,
++    mut fights: ResMut<Fights>,
++    time: Res<Time>,
++) {
++    let now = time.elapsed_secs();
++    let mut hits: Vec<(u64, f32)> = Vec::new();
++    for e in &wc.events {
++        match e.kind {
++            EV_HIT_ACTOR if e.a > 0.0 => {
++                let Some(g) = ids.guid(e.form_id) else { continue };
++                match hits.iter_mut().find(|(h, _)| *h == g) {
++                    Some(h) => h.1 += e.a,
++                    None => hits.push((g, e.a)),
++                }
++            }
++            EV_ORE_MINED => {
++                if let Some(g) = ids.guid(e.form_id) {
++                    info!("wowcraft: node {g:#x} taken in Minecraft; hidden here for {TAKEN_SECS:.0} s");
++                    fights.taken.insert(g, now + TAKEN_SECS);
++                }
++            }
++            _ => {}
++        }
++    }
++    for (g, mc) in hits {
++        let Some(store) = index.0.get(&g).and_then(|&e| stores.get(e).ok()) else { continue };
++        if store.0.unit_is_dead() {
++            continue;
++        }
++        let level = store.0.unit_level().unwrap_or(1);
++        let damage = wow_damage(mc, level, store.0.unit_max_health().unwrap_or(1));
++        let name = names.peek_unit(g, Some(store)).unwrap_or("?");
++        info!("wowcraft: hit {name} for {mc:.1} Minecraft -> {damage}");
++        select.select_unit(g);
++        gm.say(&format!(".damage {damage}"));
++        fights.hit.insert(g, now);
++    }
++    fights.taken.retain(|_, until| now < *until);
++}
++
++/// Our kills drop Minecraft loot where they fell.
++fn kill_loot(
++    wc: Res<WowCraft>,
++    index: Res<GuidIndex>,
++    units: Query<(&ObjectStore, &GlobalTransform)>,
++    names: Res<NameCache>,
++    mut fights: ResMut<Fights>,
++    time: Res<Time>,
++) {
++    let now = time.elapsed_secs();
++    let mut dead: Vec<u64> = std::mem::take(&mut fights.kills);
++    for (&g, &when) in &fights.hit {
++        if now - when > FIGHT_SECS {
++            continue;
++        }
++        if index.0.get(&g).and_then(|&e| units.get(e).ok()).is_some_and(|(s, _)| s.0.unit_is_dead()) {
++            dead.push(g);
++        }
++    }
++    for g in dead {
++        if !fights.looted.insert(g) {
++            continue;
++        }
++        fights.hit.remove(&g);
++        let Some((store, at)) = index.0.get(&g).and_then(|&e| units.get(e).ok()) else { continue };
++        let entry = store.0.object_entry().unwrap_or(0);
++        let name = names.peek_unit(g, Some(store)).unwrap_or("?").to_string();
++        let ctype = names.creature_type(entry).unwrap_or(0);
++        let level = store.0.unit_level().unwrap_or(1);
++        let loot = loot_for(&name, ctype, level, g);
++        let pos = at.translation() + Vec3::Y * 0.5;
++        let list: Vec<String> = loot.iter().map(|(i, n)| format!("{n} {}", super::gifts::TABLE[*i as usize])).collect();
++        info!("wowcraft: killed {name} (level {level}); Minecraft loot: {}", list.join(", "));
++        for (item, count) in loot {
++            super::gifts::drop_at(&wc.link, item, count, pos);
++        }
++    }
++    fights.hit.retain(|_, when| now - *when <= FIGHT_SECS);
++    if fights.looted.len() > 4096 {
++        fights.looted.clear();
++    }
++}
++
++/// What a creature drops in Minecraft: by its kind and name, emeralds more likely as it levels.
++/// `seed` makes it the same every time for the one creature.
++pub(crate) fn loot_for(name: &str, creature_type: u32, level: u32, seed: u64) -> Vec<(u8, u8)> {
++    use super::gifts::item;
++    let n = name.to_ascii_lowercase();
++    let has = |words: &[&str]| words.iter().any(|w| n.contains(w));
++    let roll = |salt: u64| (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(salt.wrapping_mul(0xBF58_476D_1CE4_E5B9)) >> 33) % 100;
++    let mut out: Vec<(u8, u8)> = Vec::new();
++    match creature_type {
++        // Beast and critter: their meat, by what they are.
++        1 | 8 => {
++            let count = if creature_type == 8 { 1 } else { 1 + (roll(1) % 2) as u8 };
++            if has(&["boar", "pig", "swine", "hog"]) {
++                out.push((item("porkchop"), count));
++            } else if has(&["chicken", "hen", "rooster", "owl", "hawk", "vulture", "condor", "buzzard", "carrion", "bird", "parrot", "turkey"]) {
++                out.push((item("chicken"), count));
++                out.push((item("feather"), 1 + (roll(2) % 3) as u8));
++            } else if has(&["rabbit", "hare"]) {
++                out.push((item("rabbit"), count));
++            } else if has(&["sheep", "ram", "goat", "mountain"]) && !has(&["lion"]) {
++                out.push((item("mutton"), count));
++            } else if has(&["crab", "turtle", "crocolisk", "fish", "shark", "eel", "makrura", "clam"]) {
++                out.push((item(if roll(3) < 50 { "cod" } else { "salmon" }), count));
++            } else if has(&["spider", "widow", "tarantula", "crawler", "lurker", "creeper"]) {
++                out.push((item("string"), 1 + (roll(4) % 3) as u8));
++                if roll(5) < 40 {
++                    out.push((item("spider_eye"), 1));
++                }
++            } else if has(&["scorpid", "scorpion", "silithid", "wasp", "bug", "beetle"]) {
++                out.push((item("string"), 1));
++            } else if has(&["ooze", "slime", "jelly"]) {
++                out.push((item("slime_ball"), 1 + (roll(6) % 2) as u8));
++            } else if creature_type == 1 {
++                out.push((item("beef"), count));
++            }
++            if creature_type == 1 && roll(7) < 50 {
++                out.push((item("leather"), 1));
++            }
++        }
++        // Dragonkin.
++        2 => {
++            out.push((item("gold_nugget"), 2 + (roll(1) % 4) as u8));
++            if roll(2) < 15 {
++                out.push((item("ender_pearl"), 1));
++            }
++        }
++        // Demon.
++        3 => out.push((item("blaze_powder"), 1 + (roll(1) % 2) as u8)),
++        // Elemental.
++        4 => {
++            let dust = match roll(1) % 3 {
++                0 => "redstone",
++                1 => "glowstone_dust",
++                _ => "gunpowder",
++            };
++            out.push((item(dust), 1 + (roll(2) % 3) as u8));
++            if has(&["ooze", "slime", "sludge"]) {
++                out.push((item("slime_ball"), 1));
++            }
++        }
++        // Giant.
++        5 => {
++            out.push((item("bone"), 2 + (roll(1) % 3) as u8));
++            out.push((item("iron_ingot"), 1));
++        }
++        // Undead.
++        6 => {
++            out.push((item("rotten_flesh"), 1 + (roll(1) % 2) as u8));
++            if roll(2) < 60 {
++                out.push((item("bone"), 1 + (roll(3) % 2) as u8));
++            }
++        }
++        // Humanoid.
++        7 => {
++            if has(&["murloc", "naga", "makrura"]) {
++                out.push((item(if roll(1) < 50 { "cod" } else { "salmon" }), 1));
++            } else if has(&["kobold", "miner", "tunneler"]) {
++                out.push((item("torch"), 1 + (roll(1) % 3) as u8));
++            } else if roll(1) < 35 {
++                out.push((item("bread"), 1));
++            }
++            if roll(2) < 40 {
++                out.push((item("iron_nugget"), 1 + (roll(3) % 3) as u8));
++            }
++            if has(&["archer", "hunter", "ranger", "tracker", "scout", "poacher"]) {
++                out.push((item("arrow"), 2 + (roll(4) % 5) as u8));
++            }
++        }
++        // Mechanical.
++        9 => {
++            out.push((item("iron_nugget"), 2 + (roll(1) % 4) as u8));
++            if roll(2) < 30 {
++                out.push((item("redstone"), 1));
++            }
++        }
++        _ => {}
++    }
++    // Emeralds: one in five at level 1, most of the time by 60.
++    let emerald_chance = 20 + level.min(60) as u64;
++    if creature_type != 8 && roll(9) < emerald_chance {
++        out.push((item("emerald"), 1 + (level / 25) as u8));
++    }
++    out
++}
++
++/// The share of our health a WoW hit takes, onto Minecraft's player.
++fn hurt(wc: &WowCraft, me: Option<&ObjectStore>, kind: u16, wow: u32, attacker: u32, flags: i32) {
++    if !wc.mc_in_world() || wow == 0 {
++        return;
++    }
++    let (max, level) = me.map_or((100, 1), |s| (s.0.unit_max_health().unwrap_or(100), s.0.unit_level().unwrap_or(1)));
++    let mc = mc_damage(wow, max, level);
++    let amount = hurt_amount(mc);
++    if amount <= 0 {
++        return;
++    }
++    debug!("wowcraft: WoW hit us for {wow} of {max}: {mc:.2} Minecraft");
++    wc.link.push_input(IN_HURT, kind, amount, attacker as i32, flags);
++}
++
++/// `HITINFO_CRITICALHIT`: a crit knocks Minecraft's player back.
++const HITINFO_CRITICAL: u32 = 0x80;
++const HURT_KNOCKBACK: i32 = 2;
++
++fn on_attacker_state(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    self_guid: Res<SelfGuid>,
++    ids: Res<FormIds>,
++    me: Query<&ObjectStore, With<SelfPlayer>>,
++) {
++    let SessionEvent::AttackerState(s) = ev else { return };
++    if Some(s.victim) != self_guid.0 || s.attacker == s.victim {
++        return;
++    }
++    let flags = if s.hit_info & HITINFO_CRITICAL != 0 { HURT_KNOCKBACK } else { 0 };
++    hurt(&wc, me.single().ok(), HURT_MELEE, s.damage, ids.peek(s.attacker).unwrap_or(0), flags);
++}
++
++fn on_spell_damage(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    self_guid: Res<SelfGuid>,
++    ids: Res<FormIds>,
++    me: Query<&ObjectStore, With<SelfPlayer>>,
++) {
++    let SessionEvent::SpellDamageLog(s) = ev else { return };
++    if Some(s.target) != self_guid.0 || s.attacker == s.target {
++        return;
++    }
++    // Physical school is a shot or a throw; anything else is magic.
++    let kind = if s.school == 0 { HURT_PROJECTILE } else { HURT_MAGIC };
++    hurt(&wc, me.single().ok(), kind, s.damage, ids.peek(s.attacker).unwrap_or(0), 0);
++}
++
++fn on_periodic_damage(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    self_guid: Res<SelfGuid>,
++    ids: Res<FormIds>,
++    me: Query<&ObjectStore, With<SelfPlayer>>,
++) {
++    let SessionEvent::PeriodicAuraLog(s) = ev else { return };
++    if Some(s.target) != self_guid.0 || s.caster == s.target {
++        return;
++    }
++    let attacker = ids.peek(s.caster).unwrap_or(0);
++    for tick in &s.ticks {
++        if let PeriodicTick::Damage { amount, .. } = tick {
++            hurt(&wc, me.single().ok(), HURT_MAGIC, *amount, attacker, 0);
++        }
++    }
++}
++
++/// Lava, slime, fire and fatigue hurt; falling and drowning are Minecraft's own.
++fn on_environmental_damage(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    self_guid: Res<SelfGuid>,
++    me: Query<&ObjectStore, With<SelfPlayer>>,
++) {
++    let SessionEvent::EnvironmentalDamageLog(e) = ev else { return };
++    if Some(e.victim) != self_guid.0 {
++        return;
++    }
++    // 0 fatigue, 1 drowning, 2 falling, 3 lava, 4 slime, 5 fire.
++    if matches!(e.damage_type, 1 | 2) {
++        return;
++    }
++    hurt(&wc, me.single().ok(), HURT_OTHER, e.damage, 0, 0);
++}
++
++/// Our swings are Minecraft's: WoW's auto-attack, started by a click with WoW's cursor or a key,
++/// is stopped.
++fn on_attack_start(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    self_guid: Res<SelfGuid>,
++    index: Res<GuidIndex>,
++    stores: Query<&ObjectStore>,
++    names: Res<NameCache>,
++    gm: Gm,
++) {
++    let SessionEvent::AttackStart { attacker, victim } = ev else { return };
++    if Some(attacker) != self_guid.0 || !wc.mc_in_world() {
++        return;
++    }
++    let store = index.0.get(&victim).and_then(|&e| stores.get(e).ok());
++    let name = names.peek_unit(victim, store).unwrap_or("?");
++    info!("wowcraft: stopping WoW's auto-attack on {name}");
++    gm.send(ClientCommand::AttackStop);
++}
++
++/// Nodes Minecraft took stay hidden here until they're back.
++fn hide_taken_nodes(
++    fights: Res<Fights>,
++    index: Res<GuidIndex>,
++    mut shown: Query<&mut Visibility>,
++    time: Res<Time>,
++) {
++    let now = time.elapsed_secs();
++    for (g, &until) in &fights.taken {
++        if now >= until {
++            continue;
++        }
++        if let Some(mut v) = index.0.get(g).and_then(|&e| shown.get_mut(e).ok()) {
++            if *v != Visibility::Hidden {
++                *v = Visibility::Hidden;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn nodes_by_name() {
++        assert_eq!(node_of("Copper Vein").map(|n| n.kind), Some(0));
++        assert_eq!(node_of("Ooze Covered Silver Vein").map(|n| n.kind), Some(3));
++        assert_eq!(node_of("Small Thorium Vein").map(|n| n.kind), Some(7));
++        assert_eq!(node_of("Peacebloom").map(|n| n.kind), Some(13));
++        assert_eq!(node_of("Arthas' Tears").map(|n| n.kind), Some(21));
++        assert_eq!(node_of("Anvil").map(|n| n.kind), Some(28));
++        assert_eq!(node_of("Battered Chest").map(|n| n.kind), Some(32));
++        assert_eq!(node_of("Wanted Poster"), None);
++        // Every kind is one the mod has (0..=39).
++        for (_, k) in ORES.iter().chain(HERBS) {
++            assert!(*k < 40);
++        }
++    }
++
++    #[test]
++    fn traders() {
++        assert!(is_trader(NPC_INNKEEPER, None));
++        assert!(is_trader(NPC_VENDOR, Some("General Goods")));
++        assert!(is_trader(NPC_VENDOR | 1, Some("Trade Supplies")));
++        assert!(!is_trader(NPC_VENDOR, Some("Weaponsmith")));
++        assert!(!is_trader(0, Some("General Goods")));
++    }
++
++    #[test]
++    fn damage_both_ways() {
++        // A wooden sword (4) on a level-1 boar of 42: about three hits.
++        let d = wow_damage(4.0, 1, 42);
++        assert!((12..=16).contains(&d), "{d}");
++        // A stone sword (5) on a level-10 wolf of 200: four or five.
++        let d = wow_damage(5.0, 10, 200);
++        assert!(200 / d >= 3 && 200 / d <= 5, "{d}");
++        // Netherite (8) on a level-60 elite of 20000 still lands real hits.
++        assert!(wow_damage(8.0, 60, 20000) >= 4000);
++        assert_eq!(wow_damage(0.0, 10, 200), 0);
++        // A hit for a tenth of our health at level 1: a little over two half hearts.
++        let mc = mc_damage(10, 100, 1);
++        assert!((2.5..2.7).contains(&mc), "{mc}");
++        // The mod divides by a hundred, then by five.
++        assert_eq!(hurt_amount(2.0), 1000);
++    }
++
++    #[test]
++    fn names_fit_the_record() {
++        let n = name_bytes("Defias Pillager");
++        assert_eq!(&n[..15], b"Defias Pillager");
++        assert_eq!(n[15], 0);
++        let long = name_bytes("Ragnaros the Firelord of Molten Core");
++        assert_eq!(long[23], 0);
++        // A multi-byte character isn't split.
++        let s = "ééééééééééééé"; // 26 bytes
++        let b = name_bytes(s);
++        assert!(std::str::from_utf8(&b[..b.iter().position(|&c| c == 0).unwrap()]).is_ok());
++    }
++
++    #[test]
++    fn loot_by_kind() {
++        let boar = loot_for("Mottled Boar", 1, 2, 7);
++        assert!(boar.iter().any(|(i, _)| super::super::gifts::TABLE[*i as usize] == "porkchop"));
++        let skeleton = loot_for("Rattlecage Skeleton", 6, 5, 9);
++        assert!(skeleton.iter().any(|(i, _)| super::super::gifts::TABLE[*i as usize] == "rotten_flesh"));
++        // The same creature drops the same.
++        assert_eq!(loot_for("Kobold Miner", 7, 3, 42), loot_for("Kobold Miner", 7, 3, 42));
++    }
++
++    #[test]
++    fn form_ids_are_stable_and_never_zero() {
++        let mut ids = FormIds::default();
++        let a = ids.id(0xF130_0000_0000_0001);
++        let b = ids.id(0xF130_0000_0000_0002);
++        assert_ne!(a, 0);
++        assert_ne!(a, b);
++        assert_eq!(ids.id(0xF130_0000_0000_0001), a);
++        assert_eq!(ids.guid(b), Some(0xF130_0000_0000_0002));
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/gifts.rs b/crates/benilla-app/src/wowcraft/gifts.rs
+new file mode 100644
+index 00000000..afe2b390
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/gifts.rs
+@@ -0,0 +1,234 @@
++//! What WoW gives, Minecraft gets:
++//! - each WoW character has its own Minecraft inventory: `IN_CHARACTER` tells the mod whose
++//!   things Minecraft's player holds, on entering the world and whenever Minecraft comes back;
++//! - a finished quest gives emeralds (its money), a piece of gear for our level (enchanted as we
++//!   go up), food and experience;
++//! - experience WoW awards turns up as Minecraft experience, as orbs where the kill fell.
++//!
++//! Items cross as indexes into the mod's `WowGifts.TABLE` ([`TABLE`]).
++
++use benilla_protocol::{SessionEvent, SessionEventKind};
++use bevy::prelude::*;
++
++use wowcraft_link::proto::*;
++use wowcraft_link::Link;
++
++use super::WowCraft;
++use crate::char_select::ClientState;
++use crate::net::{GuidIndex, NetHandlerApp, ObjectStore, SelfGuid, SelfPlayer};
++
++/// The mod's `WowGifts.TABLE`, in its order: index 0 is experience points.
++pub(crate) const TABLE: &[&str] = &[
++    "experience", "beef", "porkchop", "mutton", "chicken", "rabbit", "cod", "salmon", "cooked_beef",
++    "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_rabbit", "cooked_cod",
++    "cooked_salmon", "emerald", "bread", "golden_apple", "golden_carrot", "stone_sword",
++    "iron_sword", "diamond_sword", "netherite_sword", "stone_axe", "iron_axe", "diamond_axe",
++    "netherite_axe", "bow", "crossbow", "shield", "arrow", "leather_helmet", "leather_chestplate",
++    "leather_leggings", "leather_boots", "chainmail_helmet", "chainmail_chestplate",
++    "chainmail_leggings", "chainmail_boots", "iron_helmet", "iron_chestplate", "iron_leggings",
++    "iron_boots", "diamond_helmet", "diamond_chestplate", "diamond_leggings", "diamond_boots",
++    "netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots", "bone",
++    "rotten_flesh", "string", "spider_eye", "leather", "feather", "gunpowder", "redstone",
++    "glowstone_dust", "iron_nugget", "gold_nugget", "iron_ingot", "coal", "ink_sac",
++    "blaze_powder", "ender_pearl", "slime_ball", "torch",
++];
++
++/// An item's index in [`TABLE`]; a name not in it is a bug, caught by the tests.
++pub(crate) fn item(name: &str) -> u8 {
++    TABLE.iter().position(|t| *t == name).unwrap_or_else(|| panic!("wowcraft: {name} isn't a gift")) as u8
++}
++
++/// The levels Minecraft's materials go with: leather and stone, chainmail, iron, diamond,
++/// netherite (the mod's `Progression.TIER_LEVELS`).
++const TIER_LEVELS: [u32; 5] = [1, 10, 20, 35, 50];
++
++pub(crate) fn tier_of(level: u32) -> usize {
++    TIER_LEVELS.iter().rposition(|&l| level >= l).unwrap_or(0)
++}
++
++pub(crate) fn plugin(app: &mut App) {
++    use SessionEventKind as K;
++    app.add_systems(Update, tell_character)
++        .net_handler(K::QuestComplete, on_quest_complete)
++        .net_handler(K::XpGain, on_xp_gain);
++}
++
++/// Put `count` of an item into Minecraft's inventory (`enchant` 0 to 3).
++pub(crate) fn give(link: &Link, item: u8, count: u32, enchant: u32) {
++    if count == 0 {
++        return;
++    }
++    info!("wowcraft: giving {count} x {}{}", TABLE[item as usize], if enchant > 0 { format!(" (enchant {enchant})") } else { String::new() });
++    link.push_input(IN_GIVE, item as u16, count.min(i32::MAX as u32) as i32, enchant.min(3) as i32, 0);
++}
++
++/// Drop `count` of an item (or experience) into Minecraft's world at `at`.
++pub(crate) fn drop_at(link: &Link, item: u8, count: u8, at: Vec3) {
++    if count == 0 {
++        return;
++    }
++    debug!("wowcraft: dropping {count} x {} at {at:?}", TABLE[item as usize]);
++    let code = item as u16 | (count as u16) << 8;
++    let eighth = |v: f32| (v * 8.0).round() as i32;
++    link.push_input(IN_DROP, code, eighth(at.x), eighth(at.y), eighth(at.z));
++}
++
++/// Whose Minecraft things these are: our WoW character, once per character and per Minecraft.
++fn tell_character(
++    wc: Res<WowCraft>,
++    state: Res<State<ClientState>>,
++    self_guid: Res<SelfGuid>,
++    mut told: Local<Option<(u64, u32)>>,
++) {
++    if *state.get() != ClientState::InWorld || !wc.mc_in_world() {
++        return;
++    }
++    let Some(guid) = self_guid.0 else { return };
++    let now = (guid, wc.mc_pid());
++    if *told == Some(now) {
++        return;
++    }
++    info!("wowcraft: Minecraft's things are WoW character {guid:#x}'s");
++    wc.link.push_input(IN_CHARACTER, 0, guid as u32 as i32, (guid >> 32) as u32 as i32, 0);
++    *told = Some(now);
++}
++
++/// A quest's reward in Minecraft.
++#[derive(Debug, PartialEq)]
++pub(crate) struct QuestGifts {
++    pub(crate) emeralds: u32,
++    /// The gear piece and its enchant level.
++    pub(crate) gear: (u8, u32),
++    pub(crate) arrows: u32,
++    pub(crate) food: (u8, u32),
++    pub(crate) experience: u32,
++}
++
++pub(crate) fn quest_gifts(quest_id: u32, money: u32, xp: u32, level: u32) -> QuestGifts {
++    let tier = tier_of(level);
++    let pieces: &[&str] = match tier {
++        0 => &["stone_sword", "stone_axe", "bow", "shield", "leather_helmet", "leather_chestplate", "leather_leggings", "leather_boots"],
++        1 => &["stone_sword", "stone_axe", "crossbow", "shield", "chainmail_helmet", "chainmail_chestplate", "chainmail_leggings", "chainmail_boots"],
++        2 => &["iron_sword", "iron_axe", "crossbow", "shield", "iron_helmet", "iron_chestplate", "iron_leggings", "iron_boots"],
++        3 => &["diamond_sword", "diamond_axe", "bow", "diamond_helmet", "diamond_chestplate", "diamond_leggings", "diamond_boots"],
++        _ => &["netherite_sword", "netherite_axe", "crossbow", "netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots"],
++    };
++    let mix = (quest_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
++    let piece = pieces[(mix % pieces.len() as u64) as usize];
++    let enchant = match tier {
++        0 => 0,
++        1 => (mix >> 8) as u32 % 2,
++        2 => 1,
++        3 => 2,
++        _ => 3,
++    };
++    let foods = ["cooked_beef", "cooked_porkchop", "cooked_mutton", "cooked_chicken", "cooked_cod", "cooked_salmon", "bread"];
++    let food = foods[((mix >> 16) % foods.len() as u64) as usize];
++    QuestGifts {
++        emeralds: (1 + ((money as f32 / 25.0).sqrt() as u32)).min(16),
++        gear: (item(piece), enchant),
++        arrows: if matches!(piece, "bow" | "crossbow") { 16 } else { 0 },
++        food: (item(food), 2 + (mix >> 24) as u32 % 3),
++        experience: (xp / 10).clamp(2, 200),
++    }
++}
++
++fn on_quest_complete(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    me: Query<&ObjectStore, With<SelfPlayer>>,
++) {
++    let SessionEvent::QuestComplete(q) = ev else { return };
++    if !wc.mc_in_world() {
++        return;
++    }
++    let level = me.single().ok().and_then(|s| s.0.unit_level()).unwrap_or(1);
++    let g = quest_gifts(q.quest_id, q.money, q.xp, level);
++    info!("wowcraft: quest {} done ({} xp, {} copper): Minecraft rewards", q.quest_id, q.xp, q.money);
++    give(&wc.link, item("emerald"), g.emeralds, 0);
++    give(&wc.link, g.gear.0, 1, g.gear.1);
++    give(&wc.link, item("arrow"), g.arrows, 0);
++    give(&wc.link, g.food.0, g.food.1, 0);
++    give(&wc.link, 0, g.experience, 0);
++}
++
++/// Minecraft experience for WoW's: a kill's as orbs where it fell (and the kill is our loot's),
++/// any other straight in.
++fn on_xp_gain(
++    In(ev): In<SessionEvent>,
++    wc: Res<WowCraft>,
++    index: Res<GuidIndex>,
++    at: Query<&GlobalTransform>,
++    mut fights: ResMut<super::combat::Fights>,
++) {
++    let SessionEvent::XpGain(x) = ev else { return };
++    if !wc.mc_in_world() {
++        return;
++    }
++    let points = (x.total / 8).clamp(1, 100);
++    let fell = (x.kill && x.victim != 0)
++        .then(|| index.0.get(&x.victim).and_then(|&e| at.get(e).ok()))
++        .flatten()
++        .map(|t| t.translation() + Vec3::Y * 0.5);
++    if x.kill && x.victim != 0 {
++        fights.kills.push(x.victim);
++    }
++    match fell {
++        Some(pos) => {
++            let mut left = points;
++            while left > 0 {
++                let n = left.min(255);
++                drop_at(&wc.link, 0, n as u8, pos);
++                left -= n;
++            }
++        }
++        None => give(&wc.link, 0, points, 0),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_table_is_the_mods() {
++        assert_eq!(TABLE.len(), 69);
++        assert_eq!(TABLE[0], "experience");
++        assert_eq!(item("emerald"), 15);
++        assert_eq!(item("netherite_boots"), 50);
++        assert_eq!(item("torch"), 68);
++        // Every loot name the combat side uses is in it.
++        for kind in 0..12 {
++            for name in ["Mottled Boar", "Plainstrider", "Kobold Miner", "Rattlecage Skeleton", "Webwood Spider", "Murloc Raider"] {
++                for (i, _) in super::super::combat::loot_for(name, kind, 30, 3) {
++                    assert!((i as usize) < TABLE.len());
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn tiers_by_level() {
++        assert_eq!(tier_of(1), 0);
++        assert_eq!(tier_of(9), 0);
++        assert_eq!(tier_of(10), 1);
++        assert_eq!(tier_of(34), 2);
++        assert_eq!(tier_of(35), 3);
++        assert_eq!(tier_of(60), 4);
++    }
++
++    #[test]
++    fn a_quest_rewards_gear_for_our_level() {
++        let low = quest_gifts(783, 35, 80, 2);
++        let name = TABLE[low.gear.0 as usize];
++        assert!(name.starts_with("stone") || name.starts_with("leather") || name == "bow" || name == "shield", "{name}");
++        assert_eq!(low.gear.1, 0);
++        assert!(low.emeralds >= 1 && low.emeralds <= 3);
++        let high = quest_gifts(4001, 60_000, 9000, 60);
++        let name = TABLE[high.gear.0 as usize];
++        assert!(name.starts_with("netherite") || name == "crossbow", "{name}");
++        assert_eq!(high.gear.1, 3);
++        assert_eq!(high.emeralds, 16);
++        assert_eq!(high.experience, 200);
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/input.rs b/crates/benilla-app/src/wowcraft/input.rs
+index 109d8e82..dcfa9374 100644
+--- a/crates/benilla-app/src/wowcraft/input.rs
++++ b/crates/benilla-app/src/wowcraft/input.rs
+@@ -324,11 +324,12 @@ mod tests {
+         }
+     }
+ 
+-    /// Minecraft's default sensitivity (0.5) turns 0.6^3 · 8 · 0.15 = 0.2592° a count.
++    /// Minecraft's default sensitivity (0.5) is 0.5 · 0.6 + 0.2 = 0.5, which turns
++    /// 0.5³ · 8 · 0.15 = 0.15° a count.
+     #[test]
+     fn the_mouse_turns_as_minecrafts_does() {
+         let (yaw, pitch) = look_delta(0.5, Vec2::new(100.0, -10.0));
+-        assert!((yaw - 25.92).abs() < 1e-3, "{yaw}");
+-        assert!((pitch + 2.592).abs() < 1e-3, "{pitch}");
++        assert!((yaw - 15.0).abs() < 1e-3, "{yaw}");
++        assert!((pitch + 1.5).abs() < 1e-3, "{pitch}");
+     }
+ }
+diff --git a/crates/benilla-app/src/wowcraft/life.rs b/crates/benilla-app/src/wowcraft/life.rs
+new file mode 100644
+index 00000000..b1ac43b8
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/life.rs
+@@ -0,0 +1,131 @@
++//! Minecraft's hearts are our life. On entering the world the WoW body is made unkillable
++//! (GM `.cheat god on`, which leaves it at one hit point at worst) and GM mode goes off, so
++//! creatures fight us. When Minecraft's player dies, so does the WoW body (`.die`); the spirit is
++//! released at once, and the ghost, once at the graveyard, is revived there (`.revive`) and made
++//! unkillable again. Minecraft's player respawns and follows us to the graveyard.
++
++use bevy::prelude::*;
++
++use wowcraft_link::proto::*;
++
++use super::combat::Gm;
++use super::WowCraft;
++use crate::char_select::ClientState;
++use crate::net::{ClientCommand, ObjectStore, SelfGuid, SelfPlayer};
++
++/// How long a step waits for the server before it's asked again.
++const RETRY_SECS: f32 = 5.0;
++/// A ghost waits this long for the graveyard teleport to settle before it's revived.
++const GHOST_SETTLE_SECS: f32 = 2.0;
++
++pub(crate) fn plugin(app: &mut App) {
++    app.init_resource::<Life>().add_systems(Update, (take_over, follow_death).chain());
++}
++
++#[derive(Resource, Default, Debug)]
++struct Life {
++    /// Set up for this world session.
++    set_up: bool,
++    /// Minecraft's player was dead last frame.
++    mc_was_dead: bool,
++    /// We asked the server to kill the WoW body, at this time.
++    dying_since: Option<f32>,
++    /// We asked for the spirit's release, at this time.
++    released_at: Option<f32>,
++    /// The body became a ghost at this time.
++    ghost_since: Option<f32>,
++    /// We asked for the revive, at this time.
++    revived_at: Option<f32>,
++}
++
++/// GM mode off and the body unkillable, once per world session with Minecraft there.
++fn take_over(
++    mut life: ResMut<Life>,
++    wc: Res<WowCraft>,
++    state: Res<State<ClientState>>,
++    player: Res<crate::player::Player>,
++    self_guid: Res<SelfGuid>,
++    selection: Res<crate::target::Selection>,
++    gm: Gm,
++) {
++    if *state.get() != ClientState::InWorld {
++        *life = Life::default();
++        return;
++    }
++    if life.set_up || !player.active || !wc.mc_in_world() {
++        return;
++    }
++    let Some(guid) = self_guid.0 else { return };
++    info!("wowcraft: Minecraft's hearts are our life; the WoW body can't die on its own");
++    gm.say(".gm off");
++    // `.cheat god` takes the selected player, or us with none; a selected creature fails it.
++    gm.send(ClientCommand::SetSelection { guid });
++    gm.say(".cheat god on");
++    gm.send(ClientCommand::SetSelection { guid: selection.guid.unwrap_or(0) });
++    life.set_up = true;
++}
++
++/// Minecraft's death is ours; our death is a trip to the graveyard and back.
++fn follow_death(
++    mut life: ResMut<Life>,
++    wc: Res<WowCraft>,
++    state: Res<State<ClientState>>,
++    self_guid: Res<SelfGuid>,
++    me: Query<&ObjectStore, With<SelfPlayer>>,
++    selection: Res<crate::target::Selection>,
++    gm: Gm,
++    time: Res<Time>,
++) {
++    if *state.get() != ClientState::InWorld || !life.set_up {
++        return;
++    }
++    let (Some(guid), Ok(me)) = (self_guid.0, me.single()) else { return };
++    let now = time.elapsed_secs();
++    let ghost = me.0.player_is_ghost();
++    let dead = me.0.unit_is_dead() && !ghost;
++
++    // Minecraft's player died: so does the WoW body.
++    let mc_dead = wc.mc.is_some_and(|m| m.flags & MC_DEAD != 0) || wc.events.iter().any(|e| e.kind == EV_PLAYER_DIED);
++    let mc_died = mc_dead && !life.mc_was_dead;
++    life.mc_was_dead = wc.mc.is_some_and(|m| m.flags & MC_DEAD != 0);
++    if mc_died && !dead && !ghost && life.dying_since.is_none() {
++        info!("wowcraft: the Minecraft player died; so do we");
++        // `.die` takes the selection, and ends god mode on it.
++        gm.send(ClientCommand::SetSelection { guid });
++        gm.say(".die");
++        gm.send(ClientCommand::SetSelection { guid: selection.guid.unwrap_or(0) });
++        life.dying_since = Some(now);
++    }
++    if let Some(since) = life.dying_since {
++        if dead || ghost || now - since > RETRY_SECS {
++            life.dying_since = None;
++        }
++    }
++
++    // Dead: the spirit goes to the graveyard.
++    if dead {
++        if life.released_at.is_none_or(|t| now - t > RETRY_SECS) {
++            info!("wowcraft: dead; releasing the spirit");
++            gm.send(ClientCommand::RepopRequest);
++            life.released_at = Some(now);
++        }
++    } else {
++        life.released_at = None;
++    }
++
++    // A ghost at the graveyard: back to life, unkillable again.
++    if ghost {
++        let since = *life.ghost_since.get_or_insert(now);
++        if now - since >= GHOST_SETTLE_SECS && life.revived_at.is_none_or(|t| now - t > RETRY_SECS) {
++            info!("wowcraft: a ghost at the graveyard; reviving");
++            gm.send(ClientCommand::SetSelection { guid });
++            gm.say(".revive");
++            gm.say(".cheat god on");
++            gm.send(ClientCommand::SetSelection { guid: selection.guid.unwrap_or(0) });
++            life.revived_at = Some(now);
++        }
++    } else {
++        life.ghost_since = None;
++        life.revived_at = None;
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/mod.rs b/crates/benilla-app/src/wowcraft/mod.rs
+index 06467785..538c680a 100644
+--- a/crates/benilla-app/src/wowcraft/mod.rs
++++ b/crates/benilla-app/src/wowcraft/mod.rs
+@@ -19,8 +19,13 @@
+ pub(crate) mod account;
+ pub(crate) mod blocks;
+ pub(crate) mod collision;
++pub(crate) mod combat;
++pub(crate) mod gifts;
+ pub(crate) mod input;
++pub(crate) mod life;
+ pub(crate) mod overlay;
++pub(crate) mod ui;
++pub(crate) mod water;
+ 
+ use std::path::PathBuf;
+ use std::sync::Arc;
+@@ -36,7 +41,20 @@ use crate::player::Player;
+ 
+ /// Whether the launcher started us as WowCraft's WoW (`WOWCRAFT=1`).
+ pub(crate) fn enabled() -> bool {
+-    std::env::var("WOWCRAFT").is_ok_and(|v| v == "1")
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("WOWCRAFT").is_ok_and(|v| v == "1"))
++}
++
++/// The server's answers to our own GM commands (`.cheat god`, `.gm off`), kept out of the chat
++/// and the error line under WowCraft.
++pub(crate) fn quiet(text: &str) -> bool {
++    if !enabled() {
++        return false;
++    }
++    let t = text.to_ascii_lowercase();
++    ["you set god mode", "god mode is on", "god mode is off", "you changed loot state", "gm mode is off"]
++        .iter()
++        .any(|q| t.contains(q))
+ }
+ 
+ pub(crate) struct WowCraftPlugin;
+@@ -61,6 +79,11 @@ impl Plugin for WowCraftPlugin {
+         collision::plugin(app, link.clone());
+         overlay::plugin(app);
+         blocks::plugin(app);
++        ui::plugin(app);
++        combat::plugin(app);
++        life::plugin(app);
++        gifts::plugin(app);
++        water::plugin(app);
+         app.insert_resource(WowCraft::new(link.clone()))
+             .add_systems(
+                 PreUpdate,
+@@ -78,6 +101,7 @@ impl Plugin for WowCraftPlugin {
+                         .after(watch_server_moves)
+                         .before(crate::player::PlayerControlSet),
+                     input::hold_cursor.after(crate::player::PlayerControlSet),
++                    follow_minecraft_view.after(crate::player::PlayerControlSet),
+                 ),
+             )
+             .add_systems(PostUpdate, publish_sky_state);
+@@ -179,7 +203,9 @@ impl WowCraft {
+             cursor_mode: false,
+             look_yaw: 0.0,
+             look_pitch: 0.0,
+-            teleport_seq: 0,
++            // Our own numbering, so a Minecraft that saw another game's teleports never reads one
++            // of ours as already done.
++            teleport_seq: std::process::id().wrapping_shl(16),
+             teleport_pos: Vec3::ZERO,
+             teleport_pending: false,
+             collision_epoch: 1,
+@@ -196,6 +222,16 @@ impl WowCraft {
+         self.collision_epoch
+     }
+ 
++    /// The world (map id + 1) Minecraft's blocks belong to.
++    pub(crate) fn world_id(&self) -> u32 {
++        self.world_id
++    }
++
++    /// The Minecraft process we're linked with, 0 with none.
++    pub(crate) fn mc_pid(&self) -> u32 {
++        self.mc_pid
++    }
++
+     /// Minecraft is there and in its world.
+     pub(crate) fn mc_in_world(&self) -> bool {
+         self.mc.is_some_and(|m| m.flags & MC_IN_WORLD != 0)
+@@ -350,6 +386,34 @@ fn prepare_drive(wc: Res<WowCraft>, mut drive: ResMut<Drive>, player: Res<Player
+     };
+ }
+ 
++/// Minecraft's view: its field of view (sprinting and water change it), and WoW's longest view
++/// distance once Minecraft flies, as an elytra climbs past where WoW's ground view reaches.
++fn follow_minecraft_view(
++    drive: Res<Drive>,
++    mut cameras: Query<&mut Projection, With<benilla_world::view::WorldCamera>>,
++    mut cvars: ResMut<crate::cvars::Cvars>,
++    mut far: Local<bool>,
++) {
++    if !drive.active {
++        return;
++    }
++    let fov = drive.fov_deg.clamp(30.0, 130.0).to_radians();
++    for mut projection in &mut cameras {
++        if let Projection::Perspective(p) = &*projection {
++            if (p.fov - fov).abs() > 1e-4 {
++                if let Projection::Perspective(p) = &mut *projection {
++                    p.fov = fov;
++                }
++            }
++        }
++    }
++    if drive.flying && !*far {
++        info!("wowcraft: view distance 500 (farclip) for flying");
++        let _ = cvars.set("farclip", "500");
++        *far = true;
++    }
++}
++
+ /// Tell Minecraft where we are and what we're doing; Minecraft paces its frames on this.
+ fn publish_sky_state(
+     mut wc: ResMut<WowCraft>,
+diff --git a/crates/benilla-app/src/wowcraft/ui.rs b/crates/benilla-app/src/wowcraft/ui.rs
+new file mode 100644
+index 00000000..583e9251
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/ui.rs
+@@ -0,0 +1,144 @@
++//! WoW's interface under WowCraft, as WowCraft has it:
++//! - the action bars hide while Minecraft has the input (its hotbar stands where they were) and come
++//!   back with WoW's cursor (C);
++//! - Log Out is off (Minecraft plays along; the launcher's Stop closes everything), and the
++//!   durability figure, which Minecraft's own armour replaces, is hidden;
++//! - our own overhead name is off (the Minecraft body has its own), the first-login cinematic is
++//!   skipped and every tutorial tip is marked seen;
++//! - character creation offers our Minecraft name.
++
++use bevy::prelude::*;
++
++use benilla_ui::script::UiScript;
++
++use super::{InputOwner, WowCraft};
++use crate::char_select::ClientState;
++
++const HIDE_BARS: &str = "for _, n in ipairs({'MainMenuBar', 'MultiBarBottomLeft', 'MultiBarBottomRight', 'ShapeshiftBarFrame', 'PetActionBarFrame'}) do local f = getglobal(n) if f then f:Hide() end end";
++const SHOW_BARS: &str = "if MainMenuBar then MainMenuBar:Show() end if MultiActionBar_Update then MultiActionBar_Update() end if ShapeshiftBar_Update then ShapeshiftBar_Update() end if PetActionBar_Update then PetActionBar_Update() end";
++const SETUP: &str = "if GameMenuButtonLogout then GameMenuButtonLogout:Disable() end if DurabilityFrame then pcall(function() DurabilityFrame:UnregisterAllEvents() end) DurabilityFrame:Hide() end";
++/// What a refused Log Out says, in WoW's system-message gold.
++pub(crate) const LOGOUT_REFUSED: &str = "if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage('Log Out is off in WowCraft: Minecraft plays along. Close the game with the launcher\\'s Stop.', 1, 0.82, 0.25) end";
++
++pub(crate) fn plugin(app: &mut App) {
++    app.add_systems(
++        Update,
++        (prepare_ui, action_bars, skip_cinematic, mark_tutorials, offer_minecraft_name).after(crate::ui_script::UiInput),
++    );
++}
++
++/// Once per interface load in the world: Log Out off, the durability figure gone, our name off.
++fn prepare_ui(
++    script: Option<NonSendMut<UiScript>>,
++    state: Res<State<ClientState>>,
++    mut cvars: ResMut<crate::cvars::Cvars>,
++    mut memo: Local<crate::ui_script::VmMemo<bool>>,
++) {
++    let Some(script) = script else { return };
++    if *state.get() != ClientState::InWorld || !memo.claim(&script) {
++        return;
++    }
++    if let Err(e) = script.run_chunk(SETUP.as_bytes()) {
++        warn!("wowcraft: couldn't turn off Log Out: {e}");
++    }
++    for name in ["UnitNamePlayer", "UnitNameOwn"] {
++        let _ = cvars.set(name, "0");
++    }
++}
++
++/// The action bars follow who has the input.
++fn action_bars(
++    script: Option<NonSendMut<UiScript>>,
++    owner: Res<InputOwner>,
++    wc: Res<WowCraft>,
++    state: Res<State<ClientState>>,
++    mut shown: Local<Option<bool>>,
++    mut memo: Local<crate::ui_script::VmMemo<bool>>,
++) {
++    let Some(script) = script else { return };
++    if *state.get() != ClientState::InWorld {
++        *shown = None;
++        return;
++    }
++    // A fresh interface starts with them shown.
++    if memo.claim(&script) {
++        *shown = None;
++    }
++    // Shown with WoW's cursor or with no Minecraft to play; hidden while Minecraft plays.
++    let want = !owner.minecraft || !wc.mc_in_world();
++    if *shown == Some(want) {
++        return;
++    }
++    let chunk = if want { SHOW_BARS } else { HIDE_BARS };
++    match script.run_chunk(chunk.as_bytes()) {
++        Ok(()) => {
++            info!("wowcraft: action bars {}", if want { "shown" } else { "hidden" });
++            *shown = Some(want);
++        }
++        Err(e) => warn!("wowcraft: couldn't change the action bars: {e}"),
++    }
++}
++
++/// The first login's race cinematic: Minecraft's player would stand through it.
++fn skip_cinematic(mut cine: ResMut<crate::cinematic::Cinematic>, net: Option<Res<crate::net::NetCommands>>) {
++    if cine.is_playing() {
++        info!("wowcraft: skipping the cinematic");
++        crate::cinematic::stop(&mut cine, net.as_deref());
++    }
++}
++
++/// Every tip seen, once a world session's flags have landed.
++fn mark_tutorials(mut tutorials: ResMut<crate::tutorial::Tutorials>, state: Res<State<ClientState>>, mut done: Local<bool>) {
++    if *state.get() != ClientState::InWorld {
++        *done = false;
++        return;
++    }
++    if !*done && tutorials.flags_known() {
++        tutorials.clear_all();
++        info!("tutorial: WowCraft marks every tip seen");
++        *done = true;
++    }
++}
++
++/// Our Minecraft name, written by the mod, as the new character's (WoW's rules: letters only, two
++/// to twelve, one capital).
++fn offer_minecraft_name(state: Res<State<ClientState>>, sel: Option<ResMut<crate::char_create::CreateSelection>>, mut offered: Local<bool>) {
++    if *state.get() != ClientState::CharCreate {
++        *offered = false;
++        return;
++    }
++    let Some(mut sel) = sel else { return };
++    if *offered {
++        return;
++    }
++    *offered = true;
++    let Some(path) = super::env_file("WOWCRAFT_NAME_FILE") else { return };
++    let Some(name) = std::fs::read_to_string(path).ok().and_then(|t| wow_name(&t)) else { return };
++    if sel.prefill_name(&name) {
++        info!("wowcraft: offering the Minecraft name {name} for the new character");
++    }
++}
++
++/// A Minecraft name as a WoW one: its letters, at most twelve, capitalised; none if under two.
++pub(crate) fn wow_name(minecraft: &str) -> Option<String> {
++    let letters: String = minecraft.chars().filter(|c| c.is_ascii_alphabetic()).take(12).collect();
++    if letters.len() < 2 {
++        return None;
++    }
++    let mut out = letters[..1].to_ascii_uppercase();
++    out.push_str(&letters[1..].to_ascii_lowercase());
++    Some(out)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_minecraft_name_becomes_a_wow_one() {
++        assert_eq!(wow_name("Notch").as_deref(), Some("Notch"));
++        assert_eq!(wow_name("xX_Steve_99_Xx\n").as_deref(), Some("Xxstevexx"));
++        assert_eq!(wow_name("CaptainSparklez123").as_deref(), Some("Captainspark"));
++        assert_eq!(wow_name("a1").as_deref(), None);
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/water.rs b/crates/benilla-app/src/wowcraft/water.rs
+new file mode 100644
+index 00000000..6bac4985
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/water.rs
+@@ -0,0 +1,90 @@
++//! WoW's water as Minecraft's: the surface over each column of a 16×16 grid round our feet, so
++//! Minecraft's player swims in WoW's lakes and seas (and its boats float there) and burns in its
++//! lava. The mod fills air below a column's surface with its fluid; lava is told apart by a
++//! surface raised by [`LAVA_OFFSET`], as the mod reads it.
++
++use bevy::prelude::*;
++
++use benilla_assets::coords::bevy_to_wow;
++use benilla_formats::LiquidKind;
++use benilla_world::world_point::{Subject, WorldPoint};
++
++use wowcraft_link::proto::*;
++
++use super::WowCraft;
++use crate::player::Player;
++
++/// The mod's `SkyWater.LAVA_OFFSET`.
++const LAVA_OFFSET: f32 = 100_000.0;
++/// How often the grid is sampled again while we stand in one block.
++const PERIOD: f32 = 0.25;
++
++pub(crate) fn plugin(app: &mut App) {
++    app.add_systems(PostUpdate, publish_water);
++}
++
++/// One column's entry: the surface's Minecraft y, lava raised, or none.
++pub(crate) fn column(surface_y: Option<f32>, kind: Option<LiquidKind>) -> f32 {
++    match (surface_y, kind) {
++        (Some(y), Some(LiquidKind::Magma)) => y + LAVA_OFFSET,
++        (Some(y), _) => y,
++        (None, _) => NO_WATER,
++    }
++}
++
++fn publish_water(
++    wc: Res<WowCraft>,
++    player: Res<Player>,
++    world: WorldPoint,
++    time: Res<Time>,
++    mut last: Local<Option<(IVec2, u32)>>,
++    mut next: Local<f32>,
++) {
++    if !player.active || !wc.mc_in_world() {
++        *last = None;
++        return;
++    }
++    let feet = player.pos;
++    let origin = IVec2::new(feet.x.floor() as i32 - 8, feet.z.floor() as i32 - 8);
++    let now = time.elapsed_secs();
++    if *last == Some((origin, wc.world_id())) && now < *next {
++        return;
++    }
++    *next = now + PERIOD;
++    let mut grid = WaterGrid {
++        seq: 0,
++        origin_x: origin.x,
++        origin_z: origin.y,
++        world_id: wc.world_id(),
++        surface: [NO_WATER; WATER_GRID_SIZE * WATER_GRID_SIZE],
++    };
++    for dz in 0..WATER_GRID_SIZE {
++        for dx in 0..WATER_GRID_SIZE {
++            // The column's centre, asked at our feet's height: a building's pool answers only on
++            // its own floor.
++            let at = Vec3::new(origin.x as f32 + dx as f32 + 0.5, feet.y, origin.y as f32 + dz as f32 + 0.5);
++            let wow = bevy_to_wow(at);
++            let hit = world.liquid_at(Subject::Player, wow);
++            // A whole flooded room answers with no surface of its own: it's over our head.
++            let surface = hit.map(|h| if h.surface_z == f32::MAX { feet.y + 3.0 } else { at.y + (h.surface_z - wow[2]) });
++            grid.surface[dz * WATER_GRID_SIZE + dx] = column(surface, hit.map(|h| h.kind));
++        }
++    }
++    wc.link.write_water_grid(&grid);
++    *last = Some((origin, wc.world_id()));
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn columns_as_the_mod_reads_them() {
++        assert_eq!(column(None, None), NO_WATER);
++        assert_eq!(column(Some(12.5), Some(LiquidKind::Still)), 12.5);
++        assert_eq!(column(Some(12.5), Some(LiquidKind::Ocean)), 12.5);
++        // The mod reads anything over 50000 as lava, 100000 lower.
++        let lava = column(Some(-3.0), Some(LiquidKind::Magma));
++        assert!(lava > 50_000.0 && (lava - LAVA_OFFSET + 3.0).abs() < 1e-3);
++    }
++}
+diff --git a/crates/wowcraft-link/src/link.rs b/crates/wowcraft-link/src/link.rs
+index 91f408e9..69df9e93 100644
+--- a/crates/wowcraft-link/src/link.rs
++++ b/crates/wowcraft-link/src/link.rs
+@@ -126,6 +126,11 @@ impl Link {
+         // SAFETY: all inside the mapping.
+         unsafe {
+             std::ptr::write_bytes(self.base.add(OFF_SKY_STATE), 0, std::mem::size_of::<SkyState>());
++            // Unlike a Windows mapping this one outlives a game: a state Minecraft wrote for the
++            // last one (its position, its teleport ack) isn't ours. A live Minecraft writes its
++            // next on its next frame.
++            std::ptr::write_bytes(self.base.add(OFF_MC_STATE), 0, std::mem::size_of::<McState>());
++            std::ptr::write_bytes(self.base.add(OFF_WATER_GRID), 0, std::mem::size_of::<WaterGrid>());
+             std::ptr::write_bytes(self.base.add(OFF_OVERLAY_CTL), 0, 0x100);
+             std::ptr::write_bytes(self.base.add(OFF_INPUT_RING), 0, RING_DATA);
+             std::ptr::write_bytes(self.base.add(OFF_COLLISION_RING), 0, RING_DATA);
+-- 
+2.50.1 (Apple Git-155)
+

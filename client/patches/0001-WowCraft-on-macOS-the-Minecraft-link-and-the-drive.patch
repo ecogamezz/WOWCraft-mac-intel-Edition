@@ -1,0 +1,2338 @@
+From b40bb43f249228fb72454f351675bcca8ebe4446 Mon Sep 17 00:00:00 2001
+From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:16:21 +0200
+Subject: [PATCH 1/3] WowCraft on macOS: the Minecraft link and the drive
+
+wowcraft-link: the SkyCraft shared-memory protocol (version 11 with
+WowCraft's additions) and the game's end of it on POSIX shared memory,
+tested against the WowCraft mod's own SkyLink in another process.
+
+benilla-app's wowcraft module (WOWCRAFT=1): Minecraft's physics move the
+body through a puppet branch in the controller, Minecraft has the keys
+and mouse but WoW's own (C, Enter, M, L, B, O), and our view is told to
+Minecraft each frame. Verified live against vmangos: a stand-in Minecraft
+walked the character 31 yd and the server saved it there.
+
+Built and tested on macOS x86_64 only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                                  |   9 +
+ crates/benilla-app/Cargo.toml               |   2 +
+ crates/benilla-app/src/bindings.rs          |   9 +-
+ crates/benilla-app/src/char_select/mod.rs   |   5 +
+ crates/benilla-app/src/game_plugins.rs      |   2 +
+ crates/benilla-app/src/lib.rs               |   2 +
+ crates/benilla-app/src/player.rs            |   2 +
+ crates/benilla-app/src/player/camera.rs     |   5 +-
+ crates/benilla-app/src/player/controller.rs |  22 +
+ crates/benilla-app/src/player/puppet.rs     | 116 +++++
+ crates/benilla-app/src/player/state.rs      |  10 +
+ crates/benilla-app/src/wowcraft/input.rs    | 334 +++++++++++++
+ crates/benilla-app/src/wowcraft/mod.rs      | 455 +++++++++++++++++
+ crates/wowcraft-link/Cargo.toml             |  13 +
+ crates/wowcraft-link/examples/fake_game.rs  |  50 ++
+ crates/wowcraft-link/src/lib.rs             |   8 +
+ crates/wowcraft-link/src/link.rs            | 522 ++++++++++++++++++++
+ crates/wowcraft-link/src/proto.rs           | 501 +++++++++++++++++++
+ 18 files changed, 2065 insertions(+), 2 deletions(-)
+ create mode 100644 crates/benilla-app/src/player/puppet.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/input.rs
+ create mode 100644 crates/benilla-app/src/wowcraft/mod.rs
+ create mode 100644 crates/wowcraft-link/Cargo.toml
+ create mode 100644 crates/wowcraft-link/examples/fake_game.rs
+ create mode 100644 crates/wowcraft-link/src/lib.rs
+ create mode 100644 crates/wowcraft-link/src/link.rs
+ create mode 100644 crates/wowcraft-link/src/proto.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7afa1b73..f3bea62f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -547,6 +547,7 @@ dependencies = [
+  "wgpu",
+  "windows-sys 0.59.0",
+  "winit",
++ "wowcraft-link",
+ ]
+ 
+ [[package]]
+@@ -7993,6 +7994,14 @@ dependencies = [
+  "wasmparser",
+ ]
+ 
++[[package]]
++name = "wowcraft-link"
++version = "0.2.0"
++dependencies = [
++ "bytemuck",
++ "libc",
++]
++
+ [[package]]
+ name = "writeable"
+ version = "0.6.3"
+diff --git a/crates/benilla-app/Cargo.toml b/crates/benilla-app/Cargo.toml
+index 7dd1c49f..77811edc 100644
+--- a/crates/benilla-app/Cargo.toml
++++ b/crates/benilla-app/Cargo.toml
+@@ -43,6 +43,8 @@ benilla-assets = { path = "../benilla-assets", default-features = false }
+ benilla-formats = { path = "../benilla-formats", default-features = false }
+ benilla-protocol = { path = "../benilla-protocol" }
+ benilla-world = { path = "../benilla-world", default-features = false }
++# WowCraft's shared memory with the Minecraft mod (`crate::wowcraft`).
++wowcraft-link = { path = "../wowcraft-link" }
+ # The CVar diff persisted in `benilla-config/config.toml`.
+ serde = { version = "1", features = ["derive"] }
+ toml = "0.8"
+diff --git a/crates/benilla-app/src/bindings.rs b/crates/benilla-app/src/bindings.rs
+index a3b035ba..536f01f4 100644
+--- a/crates/benilla-app/src/bindings.rs
++++ b/crates/benilla-app/src/bindings.rs
+@@ -340,6 +340,8 @@ fn latch_and_dispatch(
+     mut notches: Local<WheelNotches>,
+     mut focus_lost: MessageReader<bevy::input::keyboard::KeyboardFocusLost>,
+     cover: Option<Res<crate::loading_screen::LoadingScreen>>,
++    // WowCraft: while Minecraft has the input, only WoW's own keys bind here.
++    owner: Res<crate::wowcraft::InputOwner>,
+ ) {
+     state.just.clear();
+     state.fired.clear();
+@@ -426,6 +428,10 @@ fn latch_and_dispatch(
+                 if (typing && !arrow_exempt) || eaten || sup || repeat {
+                     continue;
+                 }
++                // WowCraft: Minecraft's key (`crate::wowcraft::input`), not a WoW binding.
++                if owner.minecraft && !crate::wowcraft::input::is_wow_key(ev.key_code) {
++                    continue;
++                }
+                 if state.latched.iter().any(|(k, _)| *k == Held::Key(key)) {
+                     continue; // already latched (missed release would double-latch)
+                 }
+@@ -462,6 +468,7 @@ fn latch_and_dispatch(
+     ] {
+         if buttons.just_pressed(b)
+             && !sup
++            && !owner.minecraft
+             && hover.0.is_none()
+             && !state.latched.iter().any(|(k, _)| *k == Held::Mouse(b))
+         {
+@@ -487,7 +494,7 @@ fn latch_and_dispatch(
+     let wheel = wheel_lines(scroll.unit, scroll.delta.y);
+     // Over chrome only (`PointerOverUiPanel`): the wheel still zooms with the cursor on a
+     // nameplate, a mouse-enabled widget but not a panel.
+-    if wheel != 0.0 && !sup && !over_ui.0 {
++    if wheel != 0.0 && !sup && !over_ui.0 && !owner.minecraft {
+         let steps = notches.feed(wheel);
+         let key = if steps > 0 {
+             BindKey::WheelUp
+diff --git a/crates/benilla-app/src/char_select/mod.rs b/crates/benilla-app/src/char_select/mod.rs
+index 52934906..0110c9d8 100644
+--- a/crates/benilla-app/src/char_select/mod.rs
++++ b/crates/benilla-app/src/char_select/mod.rs
+@@ -165,6 +165,11 @@ pub(crate) struct Roster {
+ }
+ 
+ impl Roster {
++    /// No character on the account (WowCraft's scripted first run).
++    pub(crate) fn is_empty(&self) -> bool {
++        self.chars.is_empty()
++    }
++
+     /// A roster with a pick in flight, for tests outside this module.
+     #[cfg(test)]
+     pub(crate) fn with_pending_pick(chars: Vec<Character>, guid: u64) -> Self {
+diff --git a/crates/benilla-app/src/game_plugins.rs b/crates/benilla-app/src/game_plugins.rs
+index 81e0ca2f..7d5f37c4 100644
+--- a/crates/benilla-app/src/game_plugins.rs
++++ b/crates/benilla-app/src/game_plugins.rs
+@@ -123,6 +123,8 @@ impl PluginGroup for GamePlugins {
+             .add(crate::go_anim::plugin)
+             .add(crate::doodad_events::plugin)
+             .add(PlayerPlugin)
++            // WowCraft (`WOWCRAFT=1`): Minecraft's physics, input and screens; inert otherwise.
++            .add(crate::wowcraft::WowCraftPlugin)
+             .add(crate::screen_fade::ScreenFadePlugin)
+             // After PlayerPlugin, whose `control` it overrides in the same stage.
+             .add(CinematicPlugin)
+diff --git a/crates/benilla-app/src/lib.rs b/crates/benilla-app/src/lib.rs
+index 1a0e200b..0f7f5dc2 100644
+--- a/crates/benilla-app/src/lib.rs
++++ b/crates/benilla-app/src/lib.rs
+@@ -187,6 +187,8 @@ mod weapon_trail;
+ mod world_backdrop;
+ mod world_state;
+ mod world_state_ui;
++// WowCraft: Minecraft played inside the client, on only under `WOWCRAFT=1`.
++mod wowcraft;
+ 
+ use bevy::prelude::*;
+ 
+diff --git a/crates/benilla-app/src/player.rs b/crates/benilla-app/src/player.rs
+index 8fe96be4..e08c53fc 100644
+--- a/crates/benilla-app/src/player.rs
++++ b/crates/benilla-app/src/player.rs
+@@ -51,6 +51,8 @@ pub(crate) mod land;
+ mod move_trace;
+ mod movement_net;
+ mod posture;
++// WowCraft's drive: Minecraft's physics move the body ([`crate::wowcraft`]).
++mod puppet;
+ // `pub(crate)`: a remote mover's dead-reckon (`crate::net::motion::remote`) steps through the same
+ // walk resolve, as the reference runs every mover through one controller.
+ pub(crate) mod mover;
+diff --git a/crates/benilla-app/src/player/camera.rs b/crates/benilla-app/src/player/camera.rs
+index 33c00431..df4006ba 100644
+--- a/crates/benilla-app/src/player/camera.rs
++++ b/crates/benilla-app/src/player/camera.rs
+@@ -713,6 +713,8 @@ pub(super) fn latch_world_mouse(
+     window: Single<&Window, With<PrimaryWindow>>,
+     mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+     cover: Option<Res<crate::loading_screen::LoadingScreen>>,
++    // WowCraft: Minecraft's clicks (attack, use) are never the world's.
++    owner: Res<crate::wowcraft::InputOwner>,
+ ) {
+     let calls = script
+         .as_mut()
+@@ -722,7 +724,8 @@ pub(super) fn latch_world_mouse(
+         return;
+     };
+     let over_ui = pointer_over_ui.0;
+-    let world_press = rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui);
++    let world_press = !owner.minecraft
++        && (rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui));
+     let wm = &mut rig.world_mouse;
+     wm.update(&buttons, world_press);
+     // The script's calls, made since the last latch, before this frame's release.
+diff --git a/crates/benilla-app/src/player/controller.rs b/crates/benilla-app/src/player/controller.rs
+index a186ce16..7e7955e9 100644
+--- a/crates/benilla-app/src/player/controller.rs
++++ b/crates/benilla-app/src/player/controller.rs
+@@ -21,6 +21,8 @@ pub(super) fn control(
+         Res<camera_dynamics::CameraOptions>,
+         // Only `nearclip` is read here, for the self-avatar fade.
+         Res<benilla_world::view::ViewDistance>,
++        // WowCraft: Minecraft's player, when it drives our body this frame.
++        Res<crate::wowcraft::Drive>,
+     ),
+     mut net: (
+         Res<NetCommands>,
+@@ -122,6 +124,8 @@ pub(super) fn control(
+         ..*pointer.3
+     };
+     let dt = time.delta_secs();
++    // WowCraft: Minecraft drives the body and owns the mouse, so WoW's look session stands aside.
++    let puppet = Some(*pointer.6).filter(|d| d.active);
+     // Free fly reads no keys while an EditBox is `typing` (not the per-key `consumed`, a binding's
+     // concern); `binds` applied that gate when it latched, and the dev chords ignore it.
+     let typing = ui_capture.typing;
+@@ -228,6 +232,7 @@ pub(super) fn control(
+         *right_click = None;
+     }
+     let focused = window.focused;
++    if puppet.is_none() {
+     run_look_session(
+         mouse_motion,
+         both_buttons,
+@@ -247,6 +252,7 @@ pub(super) fn control(
+         time.elapsed_secs(),
+         focused,
+     );
++    }
+     // The mouse turns the view, but the body hand-off (`0x514474`) skips a body that is stunned,
+     // dead or seated (`0x5145e0`) or not ours to drive (`control_lost`, `reseat`), while the
+     // camera rotate (`0x514444`) still runs. The reference never writes the facing; writing and
+@@ -359,6 +365,22 @@ pub(super) fn control(
+             movement_net::ack_speeds_undriven(&net.0 .0, &player, &speed_acks);
+             return;
+         }
++        // WowCraft: Minecraft's physics in place of our input step ([`super::puppet`]).
++        if let Some(drive) = puppet {
++            super::puppet::step(
++                &drive,
++                &time,
++                &mut player,
++                &mut body,
++                &mut net.6,
++                &mut cam,
++                &mut cam_t,
++                &net.0 .0,
++                &speed_acks,
++                self_guid,
++            );
++            return;
++        }
+         // `0x514560`, after `apply_server_moves`, so this frame's root edge is already in `modes`.
+         let may_translate = mover.may_translate(player.modes.rooted);
+         let axes = input::move_axes(
+diff --git a/crates/benilla-app/src/player/puppet.rs b/crates/benilla-app/src/player/puppet.rs
+new file mode 100644
+index 00000000..e1b98ac5
+--- /dev/null
++++ b/crates/benilla-app/src/player/puppet.rs
+@@ -0,0 +1,116 @@
++//! WowCraft's drive: Minecraft's physics move our body. [`crate::wowcraft`] puts Minecraft's
++//! player, on our clock, in [`crate::wowcraft::Drive`]; here, in place of the input step, the body
++//! stands where that player stands and faces where we look, and everything after the input step
++//! runs as ever: the wire flags and their edges, the gait, the body's pose and the stream to the
++//! server. The camera is Minecraft's: at its eye in first person, behind or in front of it in its
++//! two third-person views, looking our way.
++
++use super::*;
++
++/// Slower than this (yd/s) along an axis is standing on it: Minecraft's own slide after a step.
++const MOVE_EPS: f32 = 0.6;
++/// Rising faster than this (yd/s) off the ground is a jump, not a step up.
++const JUMP_VY: f32 = 1.5;
++
++#[allow(clippy::too_many_arguments)]
++pub(super) fn step(
++    drive: &crate::wowcraft::Drive,
++    time: &Time,
++    player: &mut Player,
++    body: &mut BodyQuery,
++    hard_landing: &mut MessageWriter<crate::creature_anim::HardLanding>,
++    cam: &mut FlyCam,
++    cam_t: &mut Mut<Transform>,
++    sender: &crossbeam_channel::Sender<ClientCommand>,
++    speed_acks: &[crate::net::SpeedChangeMessage],
++    self_guid: Option<u64>,
++) {
++    let dt = time.delta_secs().max(1.0e-4);
++    let now = time.elapsed_secs();
++    let launch_y = player.pos.y;
++    let velocity = (drive.feet - player.pos) / dt;
++    player.pos = drive.feet;
++    player.face_yaw = drive.yaw;
++
++    // The axes Minecraft walked this frame, relative to where we face.
++    let face_rot = Quat::from_rotation_y(drive.yaw);
++    let forward = face_rot * Vec3::NEG_Z;
++    let right = face_rot * Vec3::X;
++    let flat = Vec3::new(velocity.x, 0.0, velocity.z);
++    let along = |axis: Vec3| {
++        let v = flat.dot(axis);
++        if v > MOVE_EPS {
++            1
++        } else if v < -MOVE_EPS {
++            -1
++        } else {
++            0
++        }
++    };
++    let (fwd, side) = (along(forward), along(right));
++    let swimming = drive.swimming;
++    player.swimming = swimming;
++    // Sneaking walks; a sprint is our run.
++    player.walking = drive.sneaking;
++    let airborne = !drive.on_ground && !swimming && !drive.flying;
++    let jumped = airborne && player.airborne_since.is_none() && velocity.y > JUMP_VY;
++    let axes = input::MoveAxes {
++        fwd,
++        side,
++        // The body faces the view, as with mouselook held: strafe is strafe, not a turn.
++        mouselook: true,
++        turning: false,
++        translating: fwd != 0 || side != 0,
++        autorun_armed: false,
++        strafe_left: side < 0,
++        strafe_right: side > 0,
++        turn_left: false,
++        turn_right: false,
++    };
++    let swim = swimming.then_some((fwd as f32, side as f32));
++    let frame = flags::this_frame(player, &axes, swim, airborne, jumped, false, false, true, true, now, launch_y);
++    let anim = gait::drive_body_heading(player, frame.pose, dt, swimming, axes.translating, airborne, true, TURN_RATE);
++    let _ = body_pose::drive(player, body, hard_landing, swimming, 0.0, frame.wire, anim, frame.landed, 0);
++
++    // Minecraft's camera, looking our way.
++    cam.yaw = drive.yaw;
++    cam.pitch = drive.pitch;
++    let look = Quat::from_euler(EulerRot::YXZ, drive.yaw, drive.pitch, 0.0);
++    let ahead = look * Vec3::NEG_Z;
++    let (at, rotation) = match drive.camera_mode {
++        1 => (drive.eye - ahead * drive.camera_distance, look),
++        2 => (
++            drive.eye + ahead * drive.camera_distance,
++            Quat::from_euler(EulerRot::YXZ, drive.yaw + std::f32::consts::PI, -drive.pitch, 0.0),
++        ),
++        _ => (drive.eye, look),
++    };
++    cam_t.translation = at;
++    cam_t.rotation = rotation;
++
++    // The stream to the server: a `MSG_MOVE_*` per axis edge, the jump and landing, heartbeats.
++    let transport = movement_net::wire_transport(player);
++    let skip = movement_net::SkipClock {
++        dt,
++        held: player.settling,
++        mover: player.foreign_mover.or(self_guid),
++    };
++    movement_net::stream_self_movement(
++        sender,
++        player,
++        frame.wire,
++        0.0,
++        movement_net::ArcEdges {
++            jumped,
++            wire_launch: false,
++            air_nudged: false,
++            landed: frame.landed,
++            fall_time: frame.fall_time,
++        },
++        now,
++        speed_acks,
++        None,
++        transport,
++        skip,
++    );
++}
+diff --git a/crates/benilla-app/src/player/state.rs b/crates/benilla-app/src/player/state.rs
+index 03a0d328..e9d8da2b 100644
+--- a/crates/benilla-app/src/player/state.rs
++++ b/crates/benilla-app/src/player/state.rs
+@@ -533,6 +533,16 @@ impl Player {
+         self.face_yaw
+     }
+ 
++    /// WowCraft: the server moves our body (a taxi flight, a charge), so Minecraft holds still.
++    pub(crate) fn is_carried(&self) -> bool {
++        self.server_riding
++    }
++
++    /// WowCraft: standing on a boat, zeppelin or tram deck.
++    pub(crate) fn is_riding_transport(&self) -> bool {
++        self.ride.is_some()
++    }
++
+     /// End the settle hold, called by the terrain streamer: `resident` is false when
+     /// [`SETTLE_TIMEOUT`] fired first, which the `sett` trace records.
+     pub(crate) fn end_settle(&mut self, resident: bool, now: f32) {
+diff --git a/crates/benilla-app/src/wowcraft/input.rs b/crates/benilla-app/src/wowcraft/input.rs
+new file mode 100644
+index 00000000..109d8e82
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/input.rs
+@@ -0,0 +1,334 @@
++//! Minecraft's controls inside WoW. While Minecraft owns input ([`super::InputOwner`]) every key
++//! but WoW's own goes to Minecraft as its SDL scancode, the mouse buttons and wheel go too, and the
++//! mouse turns our view, as Minecraft's own mouse would: the look is ours (zero latency for the
++//! camera) and Minecraft is told it in `SkyState`. With one of Minecraft's screens open (its
++//! inventory, chat, a chest) the cursor is shown and its position goes instead, in the overlay's
++//! pixels.
++//!
++//! WoW keeps C (its cursor, for NPCs, loot and quests), Enter (its chat), M (the map), L (the
++//! quest log), B (the bags) and O (its menu). Esc is Minecraft's menu.
++
++use bevy::input::keyboard::{Key, KeyboardInput};
++use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
++use bevy::input::ButtonState;
++use bevy::prelude::*;
++use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
++
++use wowcraft_link::proto::*;
++
++use super::{InputOwner, WowCraft};
++use crate::char_select::ClientState;
++
++/// The keys WoW keeps while Minecraft has the rest.
++pub(crate) fn is_wow_key(key: KeyCode) -> bool {
++    matches!(
++        key,
++        KeyCode::KeyC | KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::KeyM | KeyCode::KeyL | KeyCode::KeyB | KeyCode::KeyO
++    )
++}
++
++/// What Minecraft has been told is down, so a hand-over to WoW lets go of exactly that.
++#[derive(Default)]
++pub(crate) struct Held {
++    keys: Vec<u16>,
++    buttons: Vec<u16>,
++    cursor: Option<(i32, i32)>,
++    owned: bool,
++    notches: f32,
++}
++
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn forward_input(
++    mut wc: ResMut<WowCraft>,
++    owner: Res<InputOwner>,
++    state: Res<State<ClientState>>,
++    capture: Res<crate::ui_script::UiKeyboardCapture>,
++    mut keyboard: MessageReader<KeyboardInput>,
++    buttons: Res<ButtonInput<MouseButton>>,
++    motion: Res<AccumulatedMouseMotion>,
++    scroll: Res<AccumulatedMouseScroll>,
++    window: Query<&Window, With<PrimaryWindow>>,
++    mut held: Local<Held>,
++) {
++    let events: Vec<KeyboardInput> = keyboard.read().cloned().collect();
++    // C toggles WoW's cursor while in the world with Minecraft there, typing aside.
++    let in_world = *state.get() == ClientState::InWorld;
++    if in_world && wc.mc_in_world() && !capture.typing && !wc.mc_screen_open() {
++        for ev in &events {
++            if ev.state == ButtonState::Pressed && !ev.repeat && ev.key_code == KeyCode::KeyC {
++                wc.cursor_mode = !wc.cursor_mode;
++                info!("wowcraft: WoW cursor {}", if wc.cursor_mode { "on" } else { "off" });
++            }
++        }
++    }
++    if !owner.minecraft {
++        if held.owned {
++            // WoW took over (its cursor, its chat): Minecraft lets go of everything it holds.
++            wc.link.push_input(IN_RELEASE_ALL, 0, 0, 0, 0);
++            held.keys.clear();
++            held.buttons.clear();
++            held.cursor = None;
++            held.owned = false;
++        }
++        return;
++    }
++    held.owned = true;
++    let screen = wc.mc_screen_open();
++
++    for ev in &events {
++        // A Minecraft screen takes every key, WoW's too (typing in its chat or a sign).
++        if !screen && is_wow_key(ev.key_code) {
++            continue;
++        }
++        let Some(code) = sdl_scancode(ev.key_code) else {
++            continue;
++        };
++        match ev.state {
++            ButtonState::Pressed => {
++                // A repeat is a press Minecraft sees as one (its text fields repeat on it).
++                wc.link.push_input(IN_KEY, code, 1, 0, 0);
++                if !held.keys.contains(&code) {
++                    held.keys.push(code);
++                }
++                if screen {
++                    if let Some(text) = typed_text(ev) {
++                        for ch in text.chars().filter(|c| !c.is_control()) {
++                            wc.link.push_input(IN_TEXT, 0, ch as i32, 0, 0);
++                        }
++                    }
++                }
++            }
++            ButtonState::Released => {
++                wc.link.push_input(IN_KEY, code, 0, 0, 0);
++                held.keys.retain(|&k| k != code);
++            }
++        }
++    }
++
++    for (button, code) in [
++        (MouseButton::Left, 1u16),
++        (MouseButton::Middle, 2),
++        (MouseButton::Right, 3),
++        (MouseButton::Back, 4),
++        (MouseButton::Forward, 5),
++    ] {
++        if buttons.just_pressed(button) {
++            wc.link.push_input(IN_MOUSE_BUTTON, code, 1, 0, 0);
++            held.buttons.push(code);
++        }
++        if buttons.just_released(button) {
++            wc.link.push_input(IN_MOUSE_BUTTON, code, 0, 0, 0);
++            held.buttons.retain(|&b| b != code);
++        }
++    }
++
++    // The wheel in whole notches (a trackpad's fractions carry), 120 a notch as Windows counts.
++    let lines = crate::bindings::wheel_lines(scroll.unit, scroll.delta.y);
++    if lines != 0.0 {
++        held.notches += lines;
++        let whole = held.notches.trunc();
++        if whole != 0.0 {
++            held.notches -= whole;
++            wc.link.push_input(IN_SCROLL, 0, (whole * 120.0) as i32, 0, 0);
++        }
++    }
++
++    if screen {
++        // The cursor, in the overlay's (physical) pixels, when it moves.
++        if let Ok(w) = window.single() {
++            if let Some(p) = w.physical_cursor_position() {
++                let at = (p.x as i32, p.y as i32);
++                if held.cursor != Some(at) {
++                    wc.link.push_input(IN_CURSOR, 0, at.0, at.1, 0);
++                    held.cursor = Some(at);
++                }
++            }
++        }
++    } else {
++        held.cursor = None;
++        let d = motion.delta;
++        if d != Vec2::ZERO {
++            let sensitivity = wc.mc.map_or(0.5, |m| m.mouse_sensitivity);
++            let (dyaw, dpitch) = look_delta(sensitivity, d);
++            wc.look_yaw = super::wrap_degrees(wc.look_yaw + dyaw);
++            wc.look_pitch = (wc.look_pitch + dpitch).clamp(-90.0, 90.0);
++        }
++    }
++}
++
++/// Minecraft's mouse turn (`MouseHandler.turnPlayer`, `Entity.turn`): degrees of yaw and pitch for
++/// a mouse move, at its sensitivity option.
++pub(crate) fn look_delta(sensitivity: f32, delta: Vec2) -> (f32, f32) {
++    let s = sensitivity.clamp(0.0, 1.0) as f64 * 0.6 + 0.2;
++    let per = s * s * s * 8.0 * 0.15;
++    ((delta.x as f64 * per) as f32, (delta.y as f64 * per) as f32)
++}
++
++/// What a press typed, for Minecraft's text fields.
++fn typed_text(ev: &KeyboardInput) -> Option<String> {
++    if let Some(text) = &ev.text {
++        return Some(text.to_string());
++    }
++    match &ev.logical_key {
++        Key::Character(c) => Some(c.to_string()),
++        Key::Space => Some(" ".into()),
++        _ => None,
++    }
++}
++
++/// Minecraft wants the mouse hidden and held while it has it, and shown for its screens; WoW's own
++/// handling comes back when WoW has the input.
++pub(crate) fn hold_cursor(
++    wc: Res<WowCraft>,
++    owner: Res<InputOwner>,
++    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
++    mut ours: Local<bool>,
++) {
++    let Ok(mut opts) = cursor.single_mut() else {
++        return;
++    };
++    let want_hidden = owner.minecraft && !wc.mc_screen_open();
++    if want_hidden {
++        if opts.visible || opts.grab_mode != CursorGrabMode::Locked {
++            opts.visible = false;
++            opts.grab_mode = CursorGrabMode::Locked;
++        }
++        *ours = true;
++    } else if *ours {
++        // Handed back: shown and free, as WoW's cursor code expects to find it.
++        opts.visible = true;
++        opts.grab_mode = CursorGrabMode::None;
++        *ours = false;
++    }
++}
++
++/// A key's SDL scancode (the USB HID usage), which Minecraft 26's SDL input reads.
++pub(crate) fn sdl_scancode(key: KeyCode) -> Option<u16> {
++    use KeyCode::*;
++    let letter = |k: KeyCode| -> Option<u16> {
++        let order = [
++            KeyA, KeyB, KeyC, KeyD, KeyE, KeyF, KeyG, KeyH, KeyI, KeyJ, KeyK, KeyL, KeyM, KeyN, KeyO, KeyP, KeyQ, KeyR, KeyS,
++            KeyT, KeyU, KeyV, KeyW, KeyX, KeyY, KeyZ,
++        ];
++        order.iter().position(|&o| o == k).map(|i| 4 + i as u16)
++    };
++    if let Some(code) = letter(key) {
++        return Some(code);
++    }
++    Some(match key {
++        Digit1 => 30,
++        Digit2 => 31,
++        Digit3 => 32,
++        Digit4 => 33,
++        Digit5 => 34,
++        Digit6 => 35,
++        Digit7 => 36,
++        Digit8 => 37,
++        Digit9 => 38,
++        Digit0 => 39,
++        Enter => 40,
++        Escape => 41,
++        Backspace => 42,
++        Tab => 43,
++        Space => 44,
++        Minus => 45,
++        Equal => 46,
++        BracketLeft => 47,
++        BracketRight => 48,
++        Backslash => 49,
++        Semicolon => 51,
++        Quote => 52,
++        Backquote => 53,
++        Comma => 54,
++        Period => 55,
++        Slash => 56,
++        CapsLock => 57,
++        F1 => 58,
++        F2 => 59,
++        F3 => 60,
++        F4 => 61,
++        F5 => 62,
++        F6 => 63,
++        F7 => 64,
++        F8 => 65,
++        F9 => 66,
++        F10 => 67,
++        F11 => 68,
++        F12 => 69,
++        PrintScreen => 70,
++        ScrollLock => 71,
++        Pause => 72,
++        Insert => 73,
++        Home => 74,
++        PageUp => 75,
++        Delete => 76,
++        End => 77,
++        PageDown => 78,
++        ArrowRight => 79,
++        ArrowLeft => 80,
++        ArrowDown => 81,
++        ArrowUp => 82,
++        NumLock => 83,
++        NumpadDivide => 84,
++        NumpadMultiply => 85,
++        NumpadSubtract => 86,
++        NumpadAdd => 87,
++        NumpadEnter => 88,
++        Numpad1 => 89,
++        Numpad2 => 90,
++        Numpad3 => 91,
++        Numpad4 => 92,
++        Numpad5 => 93,
++        Numpad6 => 94,
++        Numpad7 => 95,
++        Numpad8 => 96,
++        Numpad9 => 97,
++        Numpad0 => 98,
++        NumpadDecimal => 99,
++        IntlBackslash => 100,
++        ContextMenu => 101,
++        ControlLeft => 224,
++        ShiftLeft => 225,
++        AltLeft => 226,
++        SuperLeft => 227,
++        ControlRight => 228,
++        ShiftRight => 229,
++        AltRight => 230,
++        SuperRight => 231,
++        _ => return None,
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn keys_are_sdl_scancodes() {
++        assert_eq!(sdl_scancode(KeyCode::KeyW), Some(26));
++        assert_eq!(sdl_scancode(KeyCode::KeyA), Some(4));
++        assert_eq!(sdl_scancode(KeyCode::KeyZ), Some(29));
++        assert_eq!(sdl_scancode(KeyCode::Space), Some(44));
++        assert_eq!(sdl_scancode(KeyCode::ShiftLeft), Some(225));
++        assert_eq!(sdl_scancode(KeyCode::Escape), Some(41));
++        assert_eq!(sdl_scancode(KeyCode::Digit1), Some(30));
++    }
++
++    #[test]
++    fn wow_keeps_its_own_keys() {
++        for k in [KeyCode::KeyC, KeyCode::Enter, KeyCode::KeyM, KeyCode::KeyL, KeyCode::KeyB, KeyCode::KeyO] {
++            assert!(is_wow_key(k));
++        }
++        for k in [KeyCode::KeyW, KeyCode::KeyE, KeyCode::KeyT, KeyCode::Escape, KeyCode::Space] {
++            assert!(!is_wow_key(k));
++        }
++    }
++
++    /// Minecraft's default sensitivity (0.5) turns 0.6^3 · 8 · 0.15 = 0.2592° a count.
++    #[test]
++    fn the_mouse_turns_as_minecrafts_does() {
++        let (yaw, pitch) = look_delta(0.5, Vec2::new(100.0, -10.0));
++        assert!((yaw - 25.92).abs() < 1e-3, "{yaw}");
++        assert!((pitch + 2.592).abs() < 1e-3, "{pitch}");
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/mod.rs b/crates/benilla-app/src/wowcraft/mod.rs
+new file mode 100644
+index 00000000..cd556dcc
+--- /dev/null
++++ b/crates/benilla-app/src/wowcraft/mod.rs
+@@ -0,0 +1,455 @@
++//! WowCraft: Minecraft played inside this client. The WowCraft Fabric mod runs a hidden Minecraft
++//! whose player is ours: Minecraft's physics move us, its hearts are our life, its hotbar and
++//! screens draw over WoW, its blocks stand in WoW's world. The two talk through shared memory
++//! ([`wowcraft_link`]); this module is the WoW side, in [`WowCraftPlugin`], on only when the
++//! launcher starts us with `WOWCRAFT=1`.
++//!
++//! Per frame, in order:
++//! - [`tick_link`] beats, reads Minecraft's state and its events, and decides who owns input;
++//! - [`input`] hands Minecraft the keyboard and mouse (all but WoW's own keys), and turns our view;
++//! - [`prepare_drive`] puts Minecraft's player, on our clock, where the controller reads it
++//!   (`crate::player`'s puppet branch walks our body there and streams it to the server);
++//! - [`publish_sky_state`] tells Minecraft where we are, where we look and what we're doing.
++//!
++//! Coordinates: Minecraft's blocks are our yards and its axes are Bevy's (+X east, +Y up, +Z
++//! south), so a position crosses unchanged. Minecraft's yaw is 0 facing +Z and grows to the west;
++//! ours (`Player::face_yaw`, the camera's) is 0 facing −Z, so one is π minus the other. Its pitch
++//! looks down where ours looks up.
++
++pub(crate) mod input;
++
++use std::path::PathBuf;
++
++use bevy::prelude::*;
++use bevy::window::PrimaryWindow;
++
++use wowcraft_link::proto::*;
++use wowcraft_link::Link;
++
++use crate::char_select::ClientState;
++use crate::player::Player;
++
++/// Whether the launcher started us as WowCraft's WoW (`WOWCRAFT=1`).
++pub(crate) fn enabled() -> bool {
++    std::env::var("WOWCRAFT").is_ok_and(|v| v == "1")
++}
++
++pub(crate) struct WowCraftPlugin;
++
++impl Plugin for WowCraftPlugin {
++    fn build(&self, app: &mut App) {
++        // Who owns input is asked by the bindings and the camera even with WowCraft off.
++        app.init_resource::<InputOwner>().init_resource::<Drive>();
++        if !enabled() {
++            return;
++        }
++        let link = match Link::create() {
++            Ok(link) => link,
++            Err(e) => {
++                error!("wowcraft: couldn't create the Minecraft link: {e}");
++                return;
++            }
++        };
++        info!("wowcraft: link up (pid {}), waiting for Minecraft", std::process::id());
++        app.insert_resource(WowCraft::new(link))
++            .add_systems(
++                PreUpdate,
++                tick_link.after(bevy::input::InputSystems),
++            )
++            .add_systems(
++                Update,
++                (
++                    input::forward_input.before(crate::ui_script::UiInput),
++                    watch_server_moves
++                        .in_set(benilla_world::schedule::WorldStage::Input)
++                        .before(crate::player::PlayerControlSet),
++                    prepare_drive
++                        .in_set(benilla_world::schedule::WorldStage::Input)
++                        .after(watch_server_moves)
++                        .before(crate::player::PlayerControlSet),
++                    input::hold_cursor.after(crate::player::PlayerControlSet),
++                ),
++            )
++            .add_systems(PostUpdate, publish_sky_state);
++        // `WOWCRAFT_TEST_CREATE=1`: an empty roster opens character creation by itself, so a
++        // scripted run (`WOW_CHARCREATE_NAME`, `WOW_CHARCREATE_PICK`) can make its character.
++        if std::env::var("WOWCRAFT_TEST_CREATE").is_ok_and(|v| v == "1") {
++            app.add_systems(Update, test_create_when_empty);
++        }
++    }
++}
++
++fn test_create_when_empty(
++    roster: Res<crate::char_select::Roster>,
++    state: Res<State<ClientState>>,
++    mut next: ResMut<NextState<ClientState>>,
++    time: Res<Time>,
++    mut since: Local<Option<f32>>,
++) {
++    if *state.get() != ClientState::CharSelect || !roster.is_empty() {
++        *since = None;
++        return;
++    }
++    let now = time.elapsed_secs();
++    // A moment for the roster to arrive before it counts as empty.
++    if now - *since.get_or_insert(now) > 3.0 {
++        info!("wowcraft: no character yet; opening character creation");
++        next.set(ClientState::CharCreate);
++        *since = None;
++    }
++}
++
++/// Who owns the keyboard and mouse this frame. With `minecraft`, WoW's bindings run only WoW's
++/// own keys ([`input::is_wow_key`]) and the world takes no clicks; everything else is Minecraft's.
++#[derive(Resource, Default, Clone, Copy, Debug)]
++pub(crate) struct InputOwner {
++    pub(crate) minecraft: bool,
++}
++
++/// Minecraft's player this frame, as the controller's puppet branch wants it. `active` only while
++/// Minecraft is in its world, alive to us, and has arrived where we last put it.
++#[derive(Resource, Default, Clone, Copy, Debug)]
++pub(crate) struct Drive {
++    pub(crate) active: bool,
++    /// Feet, Bevy space, interpolated between Minecraft's last two ticks on our clock.
++    pub(crate) feet: Vec3,
++    /// Where the eye is: feet plus Minecraft's smoothed eye height.
++    pub(crate) eye: Vec3,
++    /// Our view (Bevy convention: yaw 0 faces −Z, pitch up is positive), which the body faces.
++    pub(crate) yaw: f32,
++    pub(crate) pitch: f32,
++    pub(crate) on_ground: bool,
++    pub(crate) swimming: bool,
++    pub(crate) flying: bool,
++    pub(crate) sneaking: bool,
++    pub(crate) sprinting: bool,
++    /// Minecraft's camera: 0 first person, 1 behind, 2 in front.
++    pub(crate) camera_mode: u32,
++    pub(crate) camera_distance: f32,
++    /// Vertical, degrees.
++    pub(crate) fov_deg: f32,
++}
++
++#[derive(Resource)]
++pub(crate) struct WowCraft {
++    pub(crate) link: Link,
++    /// Minecraft's last state, while it's alive.
++    pub(crate) mc: Option<McState>,
++    /// The Minecraft process we last saw, so a restart resets the overlay swap.
++    mc_pid: u32,
++    /// C toggles WoW's cursor: on, WoW has the mouse and keyboard, Minecraft stands still.
++    pub(crate) cursor_mode: bool,
++    /// Our view, Minecraft degrees (what `SkyState` carries).
++    pub(crate) look_yaw: f32,
++    pub(crate) look_pitch: f32,
++    /// Bumped whenever WoW puts us somewhere (login, a teleport, a worldport, a landing).
++    teleport_seq: u32,
++    /// Where that put us, for `SkyState::pos` while Minecraft hasn't arrived.
++    teleport_pos: Vec3,
++    /// A server move landed this frame; it's published once the controller has applied it.
++    teleport_pending: bool,
++    collision_epoch: u32,
++    world_id: u32,
++    /// We were in the world last frame (an entry is a teleport).
++    was_in_world: bool,
++    /// We were carried (a taxi) last frame (the landing is a teleport).
++    was_carried: bool,
++    /// Minecraft's events this frame, for the systems that act on them.
++    pub(crate) events: Vec<McEvent>,
++    /// Logged once: Minecraft's first state.
++    seen_mc: bool,
++}
++
++impl WowCraft {
++    fn new(link: Link) -> Self {
++        WowCraft {
++            link,
++            mc: None,
++            mc_pid: 0,
++            cursor_mode: false,
++            look_yaw: 0.0,
++            look_pitch: 0.0,
++            teleport_seq: 0,
++            teleport_pos: Vec3::ZERO,
++            teleport_pending: false,
++            collision_epoch: 1,
++            world_id: 0,
++            was_in_world: false,
++            was_carried: false,
++            events: Vec::new(),
++            seen_mc: false,
++        }
++    }
++
++    /// Minecraft is there and in its world.
++    pub(crate) fn mc_in_world(&self) -> bool {
++        self.mc.is_some_and(|m| m.flags & MC_IN_WORLD != 0)
++    }
++
++    /// Minecraft has a screen open (its inventory, chat, a chest): it owns the cursor.
++    pub(crate) fn mc_screen_open(&self) -> bool {
++        self.mc.is_some_and(|m| m.flags & MC_SCREEN_OPEN != 0)
++    }
++
++    /// Minecraft has gone where we last put it.
++    fn mc_arrived(&self) -> bool {
++        self.mc.is_some_and(|m| m.teleport_ack == self.teleport_seq)
++    }
++
++    /// Point our view the way the body faces (Bevy yaw), as after a teleport.
++    pub(crate) fn face(&mut self, bevy_yaw: f32) {
++        self.look_yaw = mc_yaw_of(bevy_yaw);
++    }
++
++    fn teleport(&mut self, to: Vec3) {
++        self.teleport_seq = self.teleport_seq.wrapping_add(1);
++        self.teleport_pos = to;
++    }
++}
++
++/// Minecraft's yaw (degrees, 0 facing +Z) of our yaw (radians, 0 facing −Z), and back.
++pub(crate) fn mc_yaw_of(bevy_yaw: f32) -> f32 {
++    wrap_degrees(180.0 - bevy_yaw.to_degrees())
++}
++
++pub(crate) fn bevy_yaw_of(mc_yaw: f32) -> f32 {
++    (180.0 - mc_yaw).to_radians()
++}
++
++fn wrap_degrees(d: f32) -> f32 {
++    let w = d.rem_euclid(360.0);
++    if w > 180.0 {
++        w - 360.0
++    } else {
++        w
++    }
++}
++
++/// Beat, read Minecraft, collect its events, and settle who owns input.
++fn tick_link(
++    mut wc: ResMut<WowCraft>,
++    mut owner: ResMut<InputOwner>,
++    state: Res<State<ClientState>>,
++    capture: Res<crate::ui_script::UiKeyboardCapture>,
++) {
++    wc.link.heartbeat();
++    wc.mc = if wc.link.mc_alive() { wc.link.read_mc_state().or(wc.mc) } else { None };
++    let pid = if wc.mc.is_some() { wc.link.mc_pid() } else { 0 };
++    if pid != wc.mc_pid {
++        if pid != 0 {
++            info!("wowcraft: Minecraft is here (pid {pid})");
++            wc.link.reset_overlay();
++        } else {
++            info!("wowcraft: Minecraft has gone");
++        }
++        wc.mc_pid = pid;
++        wc.seen_mc = false;
++    }
++    if let (Some(mc), false) = (wc.mc, wc.seen_mc) {
++        if mc.flags & MC_IN_WORLD != 0 {
++            info!("wowcraft: Minecraft put us at {:.1} {:.1} {:.1}", mc.pos[0], mc.pos[1], mc.pos[2]);
++            wc.seen_mc = true;
++        }
++    }
++    let mut events = std::mem::take(&mut wc.events);
++    events.clear();
++    while let Some(e) = wc.link.pop_event() {
++        events.push(e);
++    }
++    wc.events = events;
++    // Minecraft has the keys while we play: in the world, Minecraft in its, no WoW cursor and no
++    // WoW edit box typing (chat), or whenever one of Minecraft's own screens is open.
++    let in_world = *state.get() == ClientState::InWorld;
++    owner.minecraft = in_world
++        && wc.mc_in_world()
++        && !capture.typing
++        && (!wc.cursor_mode || wc.mc_screen_open());
++}
++
++/// A server move (a teleport, a worldport, the GM `.tele`, a death's graveyard): Minecraft must
++/// follow, so the drive stops until it has.
++fn watch_server_moves(
++    mut wc: ResMut<WowCraft>,
++    mut teleports: MessageReader<crate::net::TeleportMessage>,
++    mut worldports: MessageReader<crate::net::WorldportMessage>,
++    mut self_moves: MessageReader<crate::net::SelfMoveMessage>,
++) {
++    let mut moved = false;
++    for t in teleports.read() {
++        info!("wowcraft: the server teleported us to {:?}", t.position);
++        moved = true;
++    }
++    for w in worldports.read() {
++        info!("wowcraft: the server sent us to map {} at {:?}", w.map_id, w.position);
++        wc.collision_epoch = wc.collision_epoch.wrapping_add(1);
++        moved = true;
++    }
++    if self_moves.read().count() > 0 {
++        moved = true;
++    }
++    if moved {
++        wc.teleport_pending = true;
++    }
++}
++
++/// Minecraft's player on our frame clock, for the controller: the last two physics ticks lerped
++/// at our time, as Minecraft's own renderer does with its partial tick.
++fn prepare_drive(wc: Res<WowCraft>, mut drive: ResMut<Drive>, player: Res<Player>) {
++    let Some(mc) = wc.mc.filter(|_| wc.mc_in_world()) else {
++        drive.active = false;
++        return;
++    };
++    let tick_ns = (mc.tick_ms.max(1.0) as f64) * 1.0e6;
++    let since = wowcraft_link::link::now_ns() as f64 - mc.tick_qpc as f64;
++    let t = (since / tick_ns).clamp(0.0, 1.0);
++    let lerp = |a: [f64; 3], b: [f64; 3]| {
++        Vec3::new(
++            (a[0] + (b[0] - a[0]) * t) as f32,
++            (a[1] + (b[1] - a[1]) * t) as f32,
++            (a[2] + (b[2] - a[2]) * t) as f32,
++        )
++    };
++    // No tick yet (a Minecraft that hasn't run one): its render position.
++    let feet = if mc.tick_qpc == 0 {
++        Vec3::new(mc.pos[0] as f32, mc.pos[1] as f32, mc.pos[2] as f32)
++    } else {
++        lerp(mc.prev, mc.cur)
++    };
++    let eye_height = mc.tick_eye_o + (mc.tick_eye - mc.tick_eye_o) * t as f32;
++    let eye_height = if eye_height > 0.0 { eye_height } else { mc.eye_height };
++    *drive = Drive {
++        // Not while a server move waits for Minecraft, nor while the server carries us.
++        active: player.active && wc.mc_arrived() && !wc.teleport_pending && !player.is_carried(),
++        feet,
++        eye: feet + Vec3::Y * eye_height,
++        yaw: bevy_yaw_of(wc.look_yaw),
++        pitch: -wc.look_pitch.to_radians(),
++        on_ground: mc.flags & MC_ON_GROUND != 0,
++        swimming: mc.flags & MC_SWIMMING != 0,
++        flying: mc.flags & MC_FLYING != 0,
++        sneaking: mc.flags & MC_SNEAKING != 0,
++        sprinting: mc.flags & MC_SPRINTING != 0,
++        camera_mode: mc.camera_mode,
++        camera_distance: mc.camera_distance,
++        fov_deg: if mc.fov_deg > 1.0 { mc.fov_deg } else { 70.0 },
++    };
++}
++
++/// Tell Minecraft where we are and what we're doing; Minecraft paces its frames on this.
++fn publish_sky_state(
++    mut wc: ResMut<WowCraft>,
++    player: Res<Player>,
++    state: Res<State<ClientState>>,
++    cover: Option<Res<crate::loading_screen::LoadingScreen>>,
++    owner: Res<InputOwner>,
++    map: Option<Res<benilla_world::world_map::CurrentMap>>,
++    window: Query<&Window, With<PrimaryWindow>>,
++    self_store: Query<&crate::net::ObjectStore, With<crate::net::SelfPlayer>>,
++) {
++    let in_world = *state.get() == ClientState::InWorld && player.active;
++    let loading = cover.is_some_and(|c| c.covering());
++    let carried = in_world && player.is_carried();
++    // Every way WoW puts us somewhere Minecraft must follow: entering the world, the server
++    // moving us, and a taxi landing ("carried no longer; Minecraft goes where we are").
++    if in_world && !wc.was_in_world {
++        info!("wowcraft: in the world at {:?}; Minecraft follows", player.pos);
++        let yaw = player.facing();
++        wc.face(yaw);
++        wc.teleport(player.pos);
++    } else if in_world && wc.teleport_pending {
++        let yaw = player.facing();
++        wc.face(yaw);
++        wc.teleport(player.pos);
++    } else if wc.was_carried && !carried && in_world {
++        info!("wowcraft: carried no longer; Minecraft goes where we are");
++        wc.teleport(player.pos);
++    }
++    wc.teleport_pending = false;
++    wc.was_in_world = in_world;
++    wc.was_carried = carried;
++    if let Some(map) = map.as_ref() {
++        let id = map.0 + 1;
++        if id != wc.world_id {
++            wc.world_id = id;
++            wc.collision_epoch = wc.collision_epoch.wrapping_add(1);
++        }
++    }
++
++    let mut flags = 0;
++    if in_world {
++        flags |= SKY_IN_GAME;
++    }
++    if loading {
++        flags |= SKY_LOADING;
++    }
++    // WoW has the input (its cursor, its chat): Minecraft lets go of what it holds.
++    if in_world && !owner.minecraft {
++        flags |= SKY_MENU_OPEN;
++    }
++    if carried {
++        flags |= SKY_CARRIED;
++    }
++    if player.is_riding_transport() {
++        flags |= SKY_RIDING;
++    }
++    if self_store.single().is_ok_and(|s| s.0.player_is_ghost()) {
++        flags |= SKY_GHOST;
++    }
++    let (w, h, hires) = window
++        .single()
++        .map(|w| (w.physical_width(), w.physical_height(), w.scale_factor() > 1.0))
++        .unwrap_or((1280, 800, false));
++    if hires {
++        flags |= SKY_HIRES;
++    }
++    // Before Minecraft has arrived, where we put it; after, where we are (it follows us there
++    // only on a new teleport).
++    let pos = if wc.mc_arrived() { player.pos } else { wc.teleport_pos };
++    let state = SkyState {
++        seq: 0,
++        flags,
++        world_id: wc.world_id,
++        collision_epoch: wc.collision_epoch,
++        pos: [pos.x as f64, pos.y as f64, pos.z as f64],
++        yaw: wc.look_yaw,
++        pitch: wc.look_pitch,
++        teleport_seq: wc.teleport_seq,
++        viewport_w: w.min(MAX_OVERLAY_W),
++        viewport_h: h.min(MAX_OVERLAY_H),
++        game_hour: 12.0,
++    };
++    wc.link.write_sky_state(&state);
++}
++
++/// The launcher's files for us (`WOWCRAFT_*_FILE`), read when there.
++pub(crate) fn env_file(var: &str) -> Option<PathBuf> {
++    std::env::var_os(var).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn yaws_cross_both_ways() {
++        // Facing north (−Z) is Minecraft's 180; west is 90 in both.
++        assert!((mc_yaw_of(0.0).abs() - 180.0).abs() < 1e-4);
++        assert!((mc_yaw_of(std::f32::consts::FRAC_PI_2) - 90.0).abs() < 1e-4);
++        for yaw in [-3.0f32, -1.0, 0.0, 0.5, 2.5] {
++            let back = bevy_yaw_of(mc_yaw_of(yaw));
++            let d = (back - yaw).rem_euclid(std::f32::consts::TAU);
++            assert!(d < 1e-4 || (std::f32::consts::TAU - d) < 1e-4, "{yaw} -> {back}");
++        }
++    }
++
++    /// A Minecraft yaw points the same way our yaw does.
++    #[test]
++    fn a_yaw_points_the_same_way() {
++        for mc in [0.0f32, 45.0, 90.0, 180.0, -90.0] {
++            let r = mc.to_radians();
++            let minecraft_forward = Vec3::new(-r.sin(), 0.0, r.cos());
++            let ours = Quat::from_rotation_y(bevy_yaw_of(mc)) * Vec3::NEG_Z;
++            assert!((minecraft_forward - ours).length() < 1e-4, "{mc}: {minecraft_forward} vs {ours}");
++        }
++    }
++}
+diff --git a/crates/wowcraft-link/Cargo.toml b/crates/wowcraft-link/Cargo.toml
+new file mode 100644
+index 00000000..a8647ef1
+--- /dev/null
++++ b/crates/wowcraft-link/Cargo.toml
+@@ -0,0 +1,13 @@
++[package]
++name = "wowcraft-link"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++description = "WowCraft's link to Minecraft: the SkyCraft shared-memory protocol (version 11 with WowCraft's additions) and the game's end of it, on macOS' POSIX shared memory"
++
++[lints]
++workspace = true
++
++[dependencies]
++libc = "0.2"
++bytemuck = { version = "1", features = ["derive"] }
+diff --git a/crates/wowcraft-link/examples/fake_game.rs b/crates/wowcraft-link/examples/fake_game.rs
+new file mode 100644
+index 00000000..2f7f5732
+--- /dev/null
++++ b/crates/wowcraft-link/examples/fake_game.rs
+@@ -0,0 +1,50 @@
++//! The game's side alone, for checking the Minecraft mod against it: makes the real link, then
++//! for `secs` seconds beats, publishes a SkyState each frame (60 a second) and prints what
++//! Minecraft reports back. `cargo run -p wowcraft-link --example fake_game -- 10`.
++
++use std::time::{Duration, Instant};
++
++use wowcraft_link::proto::*;
++use wowcraft_link::Link;
++
++fn main() {
++    let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10);
++    let link = Link::create().expect("create the link");
++    println!("fake game: link up as pid {}", std::process::id());
++    let start = Instant::now();
++    let mut frame = 0u32;
++    let mut seen_mc = false;
++    while start.elapsed() < Duration::from_secs(secs) {
++        frame += 1;
++        link.heartbeat();
++        let state = SkyState {
++            flags: SKY_IN_GAME,
++            world_id: 1,
++            pos: [-8949.95, 82.1, 132.5],
++            yaw: (frame % 360) as f32,
++            teleport_seq: 1,
++            viewport_w: 1280,
++            viewport_h: 800,
++            game_hour: 12.0,
++            ..Default::default()
++        };
++        link.write_sky_state(&state);
++        if frame % 60 == 0 {
++            link.push_input(IN_KEY, 26, 1, 0, 0);
++        }
++        if let Some(mc) = link.read_mc_state().filter(|_| link.mc_alive()) {
++            if !seen_mc {
++                println!("fake game: Minecraft pid {} is alive", link.mc_pid());
++                seen_mc = true;
++            }
++            if frame % 60 == 0 {
++                println!("fake game: Minecraft at {:?} yaw {} health {}/{} flags {:#x}", mc.pos, mc.yaw, mc.health, mc.max_health, mc.flags);
++            }
++        }
++        while let Some(e) = link.pop_event() {
++            println!("fake game: event {} on {} ({})", e.kind, e.form_id, e.a);
++        }
++        std::thread::sleep(Duration::from_millis(16));
++    }
++    println!("fake game: {frame} frames, Minecraft seen: {seen_mc}");
++}
+diff --git a/crates/wowcraft-link/src/lib.rs b/crates/wowcraft-link/src/lib.rs
+new file mode 100644
+index 00000000..3f31fb61
+--- /dev/null
++++ b/crates/wowcraft-link/src/lib.rs
+@@ -0,0 +1,8 @@
++//! WowCraft's link to the Minecraft mod, with no Bevy in it: [`proto`], the byte layout both sides
++//! agree on, and [`link`], the game's end of the shared memory. `benilla-app`'s `wowcraft` module
++//! is the game on top of it.
++
++pub mod link;
++pub mod proto;
++
++pub use link::Link;
+diff --git a/crates/wowcraft-link/src/link.rs b/crates/wowcraft-link/src/link.rs
+new file mode 100644
+index 00000000..c1b55d12
+--- /dev/null
++++ b/crates/wowcraft-link/src/link.rs
+@@ -0,0 +1,522 @@
++//! The game's end of the shared memory Minecraft reads: a POSIX shared memory object,
++//! `/SkyCraft_v1.<uid>`, where WowCraft on Windows had the named file mapping `Local\SkyCraft_v1`.
++//! The game makes it and Minecraft opens it (the mod's `MacNative.openFileMapping`).
++//!
++//! The object outlives both sides, as a Windows mapping outlives a process while the other still
++//! holds it: a game started again finds the one Minecraft has mapped and takes it over, resetting
++//! what the game owns (its state, its rings' heads, the overlay swap). The launcher removes it on
++//! Stop. Both sides stamp heartbeats in milliseconds of `CLOCK_UPTIME_RAW`.
++
++use std::ffi::CString;
++use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
++
++use crate::proto::*;
++
++/// Minecraft counts as gone once its heartbeat is this old (ms).
++const MC_TIMEOUT_MS: u64 = 3000;
++
++/// Milliseconds of the clock both sides stamp heartbeats with.
++pub fn now_ms() -> u64 {
++    now_ns() / 1_000_000
++}
++
++// <time.h> on macOS 10.12 and later; the libc crate this workspace pins doesn't carry it.
++extern "C" {
++    fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
++}
++
++/// Nanoseconds of `CLOCK_UPTIME_RAW`, Minecraft's `QueryPerformanceCounter` (at 10⁹ a second).
++pub fn now_ns() -> u64 {
++    // SAFETY: a pure clock read.
++    unsafe { clock_gettime_nsec_np(libc::CLOCK_UPTIME_RAW) }
++}
++
++/// The POSIX name of a Windows mapping name, as `MacNative.shmName` makes it.
++pub fn shm_name(base: &str) -> String {
++    // SAFETY: getuid cannot fail.
++    format!("/{base}.{}", unsafe { libc::getuid() })
++}
++
++pub struct Link {
++    base: *mut u8,
++    /// The overlay slot we read (Minecraft writes into its private back slot, starting at 1).
++    overlay_front: u32,
++}
++
++// SAFETY: every access to the mapping goes through atomics or is ordered by the seqlocks and ring
++// indices the protocol defines; the pointer itself never changes while the link lives.
++unsafe impl Send for Link {}
++unsafe impl Sync for Link {}
++
++impl Drop for Link {
++    fn drop(&mut self) {
++        // SAFETY: `base` came from our own `mmap` of exactly this length.
++        unsafe {
++            libc::munmap(self.base.cast(), MAPPING_BYTES);
++        }
++    }
++}
++
++impl Link {
++    /// Makes (or takes over) the shared memory and resets everything the game side owns.
++    pub fn create() -> std::io::Result<Link> {
++        let name = CString::new(shm_name(MAPPING_NAME)).expect("no NUL in the name");
++        let base = Self::map(&name).or_else(|e| {
++            // A stale object of another size (an older protocol): it goes, and a fresh one is made.
++            if e.raw_os_error() == Some(libc::EINVAL) {
++                // SAFETY: a plain unlink by name.
++                unsafe { libc::shm_unlink(name.as_ptr()) };
++                Self::map(&name)
++            } else {
++                Err(e)
++            }
++        })?;
++        let link = Link {
++            base,
++            overlay_front: 2,
++        };
++        link.reset();
++        Ok(link)
++    }
++
++    fn map(name: &CString) -> std::io::Result<*mut u8> {
++        // SAFETY: plain POSIX calls on a descriptor we own and close.
++        unsafe {
++            let fd = libc::shm_open(name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600 as libc::c_uint);
++            if fd < 0 {
++                return Err(std::io::Error::last_os_error());
++            }
++            let mut st: libc::stat = std::mem::zeroed();
++            if libc::fstat(fd, &mut st) != 0 {
++                let e = std::io::Error::last_os_error();
++                libc::close(fd);
++                return Err(e);
++            }
++            // A new object is sized once (macOS allows one ftruncate of a shared memory object);
++            // one already the right size is reused, whoever made it.
++            if st.st_size == 0 {
++                if libc::ftruncate(fd, MAPPING_BYTES as libc::off_t) != 0 {
++                    let e = std::io::Error::last_os_error();
++                    libc::close(fd);
++                    return Err(e);
++                }
++            } else if st.st_size as usize != MAPPING_BYTES {
++                libc::close(fd);
++                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
++            }
++            let p = libc::mmap(
++                std::ptr::null_mut(),
++                MAPPING_BYTES,
++                libc::PROT_READ | libc::PROT_WRITE,
++                libc::MAP_SHARED,
++                fd,
++                0,
++            );
++            libc::close(fd);
++            if p == libc::MAP_FAILED {
++                return Err(std::io::Error::last_os_error());
++            }
++            Ok(p.cast())
++        }
++    }
++
++    /// Everything the game owns, from a known state: Minecraft may still hold the object from a
++    /// game run before this one.
++    fn reset(&self) {
++        // SAFETY: all inside the mapping.
++        unsafe {
++            std::ptr::write_bytes(self.base.add(OFF_SKY_STATE), 0, std::mem::size_of::<SkyState>());
++            std::ptr::write_bytes(self.base.add(OFF_OVERLAY_CTL), 0, 0x100);
++            std::ptr::write_bytes(self.base.add(OFF_INPUT_RING), 0, RING_DATA);
++            std::ptr::write_bytes(self.base.add(OFF_COLLISION_RING), 0, RING_DATA);
++            std::ptr::write_bytes(self.base.add(OFF_ACTOR_TABLE), 0, AT_RECORDS + 64 * MAX_ACTORS);
++            std::ptr::write_bytes(self.base.add(OFF_EVENT_RING), 0, RING_DATA);
++            std::ptr::write_bytes(self.base.add(OFF_WORLD_ENTITIES), 0, WE_RECORDS + 96 * MAX_WORLD_ENTITIES);
++            std::ptr::write_bytes(self.base.add(OFF_RENDER_RING), 0, RING_DATA);
++        }
++        self.u32_at(H_VERSION).store(VERSION, Ordering::Relaxed);
++        self.u32_at(H_GAME_PID).store(std::process::id(), Ordering::Relaxed);
++        self.u64_at(H_GAME_HEARTBEAT).store(now_ms(), Ordering::Relaxed);
++        self.u32_at(H_MAGIC).store(MAGIC, Ordering::Release);
++    }
++
++    fn u32_at(&self, off: usize) -> &AtomicU32 {
++        debug_assert!(off % 4 == 0 && off + 4 <= MAPPING_BYTES);
++        // SAFETY: aligned, inside the mapping, which lives as long as `self`.
++        unsafe { AtomicU32::from_ptr(self.base.add(off).cast()) }
++    }
++
++    fn u64_at(&self, off: usize) -> &AtomicU64 {
++        debug_assert!(off % 8 == 0 && off + 8 <= MAPPING_BYTES);
++        // SAFETY: as `u32_at`.
++        unsafe { AtomicU64::from_ptr(self.base.add(off).cast()) }
++    }
++
++    fn write<T: bytemuck::Pod>(&self, off: usize, value: &T) {
++        let bytes = bytemuck::bytes_of(value);
++        // SAFETY: inside the mapping; ordering is the caller's protocol.
++        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(off), bytes.len()) };
++    }
++
++    fn read<T: bytemuck::Pod>(&self, off: usize) -> T {
++        let mut out = T::zeroed();
++        let bytes = bytemuck::bytes_of_mut(&mut out);
++        // SAFETY: inside the mapping.
++        unsafe { std::ptr::copy_nonoverlapping(self.base.add(off), bytes.as_mut_ptr(), bytes.len()) };
++        out
++    }
++
++    /// The bytes at `off..off + len`, which Minecraft writes (a ring message, the overlay).
++    pub fn bytes(&self, off: usize, len: usize) -> &[u8] {
++        assert!(off + len <= MAPPING_BYTES);
++        // SAFETY: inside the mapping, which lives as long as `self`.
++        unsafe { std::slice::from_raw_parts(self.base.add(off), len) }
++    }
++
++    // ---- header -----------------------------------------------------------------------------
++
++    pub fn heartbeat(&self) {
++        self.u64_at(H_GAME_HEARTBEAT).store(now_ms(), Ordering::Release);
++    }
++
++    pub fn mc_alive(&self) -> bool {
++        let last = self.u64_at(H_MC_HEARTBEAT).load(Ordering::Acquire);
++        last != 0 && now_ms().saturating_sub(last) < MC_TIMEOUT_MS
++    }
++
++    pub fn mc_pid(&self) -> u32 {
++        self.u32_at(H_MC_PID).load(Ordering::Acquire)
++    }
++
++    // ---- seqlocked state --------------------------------------------------------------------
++
++    /// One frame's state, which Minecraft paces on (the sequence goes up 2 a frame).
++    pub fn write_sky_state(&self, state: &SkyState) {
++        self.seqlocked_write(OFF_SKY_STATE, state);
++    }
++
++    pub fn sky_state_seq(&self) -> u32 {
++        self.u32_at(OFF_SKY_STATE).load(Ordering::Acquire)
++    }
++
++    pub fn write_water_grid(&self, grid: &WaterGrid) {
++        self.seqlocked_write(OFF_WATER_GRID, grid);
++    }
++
++    /// Writes all of `value` but its leading sequence word, between the odd and even bumps.
++    fn seqlocked_write<T: bytemuck::Pod>(&self, off: usize, value: &T) {
++        let seq = self.u32_at(off);
++        let s = seq.load(Ordering::Relaxed);
++        seq.store(s.wrapping_add(1), Ordering::Relaxed);
++        fence(Ordering::Release);
++        let bytes = bytemuck::bytes_of(value);
++        // SAFETY: inside the mapping; the sequence word is skipped.
++        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(4), self.base.add(off + 4), bytes.len() - 4) };
++        seq.store(s.wrapping_add(2), Ordering::Release);
++    }
++
++    /// A consistent snapshot of Minecraft's state, or none if it kept changing under us.
++    pub fn read_mc_state(&self) -> Option<McState> {
++        self.seqlocked_read::<McState>(OFF_MC_STATE, 64)
++    }
++
++    fn seqlocked_read<T: bytemuck::Pod>(&self, off: usize, attempts: usize) -> Option<T> {
++        let seq = self.u32_at(off);
++        for _ in 0..attempts {
++            let s1 = seq.load(Ordering::Acquire);
++            if s1 & 1 != 0 {
++                std::hint::spin_loop();
++                continue;
++            }
++            let value: T = self.read(off);
++            fence(Ordering::Acquire);
++            if seq.load(Ordering::Relaxed) == s1 {
++                return Some(value);
++            }
++        }
++        None
++    }
++
++    /// Nearby units, which Minecraft mirrors as hittable stand-ins.
++    pub fn write_actors(&self, actors: &[ActorRecord]) {
++        let seq = self.u32_at(OFF_ACTOR_TABLE);
++        let s = seq.load(Ordering::Relaxed);
++        seq.store(s.wrapping_add(1), Ordering::Relaxed);
++        fence(Ordering::Release);
++        let count = actors.len().min(MAX_ACTORS);
++        self.u32_at(OFF_ACTOR_TABLE + 4).store(count as u32, Ordering::Relaxed);
++        if count > 0 {
++            let bytes: &[u8] = bytemuck::cast_slice(&actors[..count]);
++            // SAFETY: the table has room for `MAX_ACTORS` records.
++            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(OFF_ACTOR_TABLE + AT_RECORDS), bytes.len()) };
++        }
++        seq.store(s.wrapping_add(2), Ordering::Release);
++    }
++
++    /// Minecraft's things we draw (arrows, items, cracks) and the block outline.
++    pub fn read_world_entities(&self) -> Option<(WorldEntitiesHeader, Vec<WorldEntity>)> {
++        let seq = self.u32_at(OFF_WORLD_ENTITIES);
++        for _ in 0..16 {
++            let s1 = seq.load(Ordering::Acquire);
++            if s1 & 1 != 0 {
++                std::hint::spin_loop();
++                continue;
++            }
++            let header: WorldEntitiesHeader = self.read(OFF_WORLD_ENTITIES);
++            let count = (header.count as usize).min(MAX_WORLD_ENTITIES);
++            let entities: Vec<WorldEntity> = (0..count)
++                .map(|i| self.read(OFF_WORLD_ENTITIES + WE_RECORDS + i * std::mem::size_of::<WorldEntity>()))
++                .collect();
++            fence(Ordering::Acquire);
++            if seq.load(Ordering::Relaxed) == s1 {
++                return Some((header, entities));
++            }
++        }
++        None
++    }
++
++    // ---- input ring (we produce) ------------------------------------------------------------
++
++    /// Queues one input event; dropped if Minecraft has fallen a whole ring behind.
++    pub fn push_input(&self, kind: u16, code: u16, a: i32, b: i32, c: i32) {
++        let head_at = self.u64_at(OFF_INPUT_RING + RING_HEAD);
++        let head = head_at.load(Ordering::Relaxed);
++        let tail = self.u64_at(OFF_INPUT_RING + RING_TAIL).load(Ordering::Acquire);
++        if head.wrapping_sub(tail) >= INPUT_RING_ENTRIES {
++            return;
++        }
++        let slot = OFF_INPUT_RING + RING_DATA + (head & (INPUT_RING_ENTRIES - 1)) as usize * 16;
++        self.write(slot, &InputEvent { kind, code, a, b, c });
++        head_at.store(head + 1, Ordering::Release);
++    }
++
++    // ---- collision ring (we produce, one thread) ----------------------------------------------
++
++    /// Appends one message; false if the ring has no room for it now (try again next frame).
++    pub fn write_collision(&self, kind: u32, payload: &[u8]) -> bool {
++        self.write_ring(OFF_COLLISION_RING, COLLISION_RING_BYTES - RING_DATA, kind, payload)
++    }
++
++    fn write_ring(&self, ring: usize, size: usize, kind: u32, payload: &[u8]) -> bool {
++        let msg = (8 + payload.len() + 7) & !7;
++        if msg > size / 2 {
++            return false;
++        }
++        let head_at = self.u64_at(ring + RING_HEAD);
++        let mut head = head_at.load(Ordering::Relaxed);
++        let tail = self.u64_at(ring + RING_TAIL).load(Ordering::Acquire);
++        let mut pos = (head % size as u64) as usize;
++        let pad = if pos + msg > size { size - pos } else { 0 };
++        if (size as u64).saturating_sub(head.wrapping_sub(tail)) < (msg + pad) as u64 {
++            return false;
++        }
++        let data = ring + RING_DATA;
++        if pad > 0 {
++            self.write(data + pos, &[COL_PAD, 0u32]);
++            head += pad as u64;
++            pos = 0;
++        }
++        self.write(data + pos, &[kind, payload.len() as u32]);
++        // SAFETY: the room was checked above and the message doesn't wrap.
++        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), self.base.add(data + pos + 8), payload.len()) };
++        head_at.store(head + msg as u64, Ordering::Release);
++        true
++    }
++
++    // ---- event ring (we consume) ------------------------------------------------------------
++
++    pub fn pop_event(&self) -> Option<McEvent> {
++        let head = self.u64_at(OFF_EVENT_RING + RING_HEAD).load(Ordering::Acquire);
++        let tail_at = self.u64_at(OFF_EVENT_RING + RING_TAIL);
++        let mut tail = tail_at.load(Ordering::Relaxed);
++        if tail >= head {
++            return None;
++        }
++        // Lapped: the oldest unread were overwritten.
++        if head - tail > EVENT_RING_ENTRIES {
++            tail = head - EVENT_RING_ENTRIES;
++        }
++        let event: McEvent = self.read(OFF_EVENT_RING + RING_DATA + (tail & (EVENT_RING_ENTRIES - 1)) as usize * 32);
++        tail_at.store(tail + 1, Ordering::Release);
++        Some(event)
++    }
++
++    // ---- render ring (we consume) -----------------------------------------------------------
++
++    /// Hands `each(type, payload)` every pending render message, up to about `max_bytes` of them.
++    /// The payload lies in the shared memory, valid until the next call frees its room.
++    pub fn drain_render(&self, max_bytes: usize, mut each: impl FnMut(u32, &[u8])) {
++        let ring = OFF_RENDER_RING;
++        let size = (RENDER_RING_BYTES - RING_DATA) as u64;
++        let head = self.u64_at(ring + RING_HEAD).load(Ordering::Acquire);
++        let tail_at = self.u64_at(ring + RING_TAIL);
++        let mut tail = tail_at.load(Ordering::Relaxed);
++        let mut done = 0usize;
++        while tail < head && done < max_bytes {
++            let pos = (tail % size) as usize;
++            let [kind, bytes]: [u32; 2] = self.read(ring + RING_DATA + pos);
++            if kind == REN_PAD {
++                tail += size - pos as u64;
++                continue;
++            }
++            each(kind, self.bytes(ring + RING_DATA + pos + 8, bytes as usize));
++            let msg = (8 + bytes as usize + 7) & !7;
++            tail += msg as u64;
++            done += msg;
++        }
++        tail_at.store(tail, Ordering::Release);
++    }
++
++    // ---- overlay triple buffer (we consume) ---------------------------------------------------
++
++    /// Swaps a newer frame into our front slot, if Minecraft published one.
++    pub fn acquire_overlay(&mut self) -> bool {
++        let state = self.u32_at(OFF_OVERLAY_CTL + OC_STATE);
++        if state.load(Ordering::Acquire) & OVERLAY_DIRTY == 0 {
++            return false;
++        }
++        let old = state.swap(self.overlay_front, Ordering::AcqRel);
++        self.overlay_front = old & 3;
++        true
++    }
++
++    /// Minecraft (re)connected: its writer starts again at slot 1.
++    pub fn reset_overlay(&mut self) {
++        self.u32_at(OFF_OVERLAY_CTL + OC_STATE).store(0, Ordering::Release);
++        self.overlay_front = 2;
++    }
++
++    pub fn overlay_front(&self) -> (OverlaySlotHdr, &[u8]) {
++        let slot = (self.overlay_front as usize).min(OVERLAY_SLOTS - 1);
++        let header: OverlaySlotHdr = self.read(OFF_OVERLAY_SLOT_HDR + slot * SLOT_HDR_BYTES);
++        let w = header.width.min(MAX_OVERLAY_W) as usize;
++        let h = header.height.min(MAX_OVERLAY_H) as usize;
++        (header, self.bytes(OFF_OVERLAY_PIXELS + slot * OVERLAY_SLOT_BYTES, w * h * 4))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A link of its own per test: the name carries the test's tag, and the object goes after.
++    pub struct TestLink {
++        pub link: Link,
++        name: CString,
++    }
++
++    impl Drop for TestLink {
++        fn drop(&mut self) {
++            // SAFETY: unlink by name.
++            unsafe { libc::shm_unlink(self.name.as_ptr()) };
++        }
++    }
++
++    /// A `Link` on a private object, the protocol's layout and all.
++    pub fn test_link(tag: &str) -> TestLink {
++        let name = CString::new(format!("/wmc-{tag}-{}", std::process::id())).unwrap();
++        // SAFETY: as `Link::create`.
++        unsafe { libc::shm_unlink(name.as_ptr()) };
++        let base = Link::map(&name).expect("map");
++        let link = Link { base, overlay_front: 2 };
++        link.reset();
++        TestLink { link, name }
++    }
++
++    #[test]
++    fn the_header_says_who_we_are() {
++        let t = test_link("hdr");
++        assert_eq!(t.link.u32_at(H_MAGIC).load(Ordering::Relaxed), MAGIC);
++        assert_eq!(t.link.u32_at(H_VERSION).load(Ordering::Relaxed), VERSION);
++        assert_eq!(t.link.u32_at(H_GAME_PID).load(Ordering::Relaxed), std::process::id());
++        assert!(!t.link.mc_alive(), "no Minecraft yet");
++        t.link.u64_at(H_MC_HEARTBEAT).store(now_ms(), Ordering::Relaxed);
++        assert!(t.link.mc_alive());
++    }
++
++    #[test]
++    fn the_sky_state_goes_up_two_a_frame() {
++        let t = test_link("sky");
++        let state = SkyState { flags: SKY_IN_GAME, pos: [1.0, 2.0, 3.0], ..Default::default() };
++        t.link.write_sky_state(&state);
++        t.link.write_sky_state(&state);
++        assert_eq!(t.link.sky_state_seq(), 4);
++        let back: SkyState = t.link.read(OFF_SKY_STATE);
++        assert_eq!(back.pos, [1.0, 2.0, 3.0]);
++    }
++
++    #[test]
++    fn input_wraps_its_ring() {
++        let t = test_link("input");
++        for i in 0..5000u32 {
++            // Minecraft keeps up: consume as we go.
++            t.link.push_input(IN_KEY, (i % 300) as u16, 1, 0, 0);
++            let head = t.link.u64_at(OFF_INPUT_RING + RING_HEAD).load(Ordering::Relaxed);
++            t.link.u64_at(OFF_INPUT_RING + RING_TAIL).store(head, Ordering::Relaxed);
++        }
++        let head = t.link.u64_at(OFF_INPUT_RING + RING_HEAD).load(Ordering::Relaxed);
++        assert_eq!(head, 5000);
++        let last: InputEvent = t.link.read(OFF_INPUT_RING + RING_DATA + ((head - 1) & 4095) as usize * 16);
++        assert_eq!(last, InputEvent { kind: IN_KEY, code: (4999 % 300) as u16, a: 1, b: 0, c: 0 });
++    }
++
++    #[test]
++    fn collision_messages_pad_at_the_end_of_the_ring() {
++        let t = test_link("col");
++        let size = COLLISION_RING_BYTES - RING_DATA;
++        // Move the head and tail near the end, as after a long session.
++        let near_end = (size - 24) as u64;
++        t.link.u64_at(OFF_COLLISION_RING + RING_HEAD).store(near_end, Ordering::Relaxed);
++        t.link.u64_at(OFF_COLLISION_RING + RING_TAIL).store(near_end, Ordering::Relaxed);
++        assert!(t.link.write_collision(COL_CLEAR, &7u32.to_le_bytes()), "fits before the end");
++        assert!(t.link.write_collision(COL_TRIS, &[0u8; 64]), "wraps with a pad");
++        let head = t.link.u64_at(OFF_COLLISION_RING + RING_HEAD).load(Ordering::Relaxed);
++        let [pad_kind, _]: [u32; 2] = t.link.read(OFF_COLLISION_RING + RING_DATA + (near_end as usize + 16));
++        assert_eq!(pad_kind, COL_PAD);
++        let [kind, bytes]: [u32; 2] = t.link.read(OFF_COLLISION_RING + RING_DATA);
++        assert_eq!((kind, bytes), (COL_TRIS, 64));
++        assert_eq!(head, size as u64 + 72);
++    }
++
++    #[test]
++    fn events_come_back_in_order() {
++        let t = test_link("ev");
++        for i in 0..3u32 {
++            let e = McEvent { kind: EV_HIT_ACTOR, form_id: i, a: i as f32, ..Default::default() };
++            t.link.write(OFF_EVENT_RING + RING_DATA + i as usize * 32, &e);
++        }
++        t.link.u64_at(OFF_EVENT_RING + RING_HEAD).store(3, Ordering::Release);
++        let got: Vec<u32> = std::iter::from_fn(|| t.link.pop_event()).map(|e| e.form_id).collect();
++        assert_eq!(got, vec![0, 1, 2]);
++    }
++
++    #[test]
++    fn render_messages_are_drained_whole() {
++        let t = test_link("ren");
++        let ring = OFF_RENDER_RING;
++        t.link.write(ring + RING_DATA, &[REN_CLEAR_ALL, 0u32]);
++        t.link.write(ring + RING_DATA + 8, &[REN_ATLAS, 8u32]);
++        t.link.write(ring + RING_DATA + 16, &[16u32, 16u32]);
++        t.link.u64_at(ring + RING_HEAD).store(24, Ordering::Release);
++        let mut seen = Vec::new();
++        t.link.drain_render(1 << 20, |kind, payload| seen.push((kind, payload.to_vec())));
++        assert_eq!(seen.len(), 2);
++        assert_eq!(seen[0], (REN_CLEAR_ALL, vec![]));
++        assert_eq!(seen[1].0, REN_ATLAS);
++        assert_eq!(bytemuck::pod_read_unaligned::<RenAtlas>(&seen[1].1).width, 16);
++        assert_eq!(t.link.u64_at(ring + RING_TAIL).load(Ordering::Relaxed), 24);
++    }
++
++    #[test]
++    fn the_overlay_swaps_only_when_minecraft_published() {
++        let mut t = test_link("ovl");
++        assert!(!t.link.acquire_overlay(), "nothing published");
++        // Minecraft published slot 1.
++        t.link.u32_at(OFF_OVERLAY_CTL).store(1 | OVERLAY_DIRTY, Ordering::Release);
++        t.link.write(OFF_OVERLAY_SLOT_HDR + SLOT_HDR_BYTES, &OverlaySlotHdr { width: 2, height: 1, ..Default::default() });
++        assert!(t.link.acquire_overlay());
++        let (hdr, pixels) = t.link.overlay_front();
++        assert_eq!((hdr.width, hdr.height, pixels.len()), (2, 1, 8));
++        assert_eq!(t.link.u32_at(OFF_OVERLAY_CTL).load(Ordering::Relaxed), 2, "our old front is its next middle");
++    }
++}
+diff --git a/crates/wowcraft-link/src/proto.rs b/crates/wowcraft-link/src/proto.rs
+new file mode 100644
+index 00000000..6b199927
+--- /dev/null
++++ b/crates/wowcraft-link/src/proto.rs
+@@ -0,0 +1,501 @@
++//! The shared-memory protocol between this client and the WowCraft Minecraft mod: SkyCraft's
++//! version 11 (`protocol/skycraft_protocol.h` in chasmlol/SkyCraft) with WowCraft's additions,
++//! byte for byte what the mod's `dev.skycraft.link.Proto` reads and writes. Every multi-byte value
++//! is little-endian; positions are Minecraft space, which is Bevy space here: blocks are yards,
++//! +X east, +Y up, +Z south.
++
++/// `"SKYC"`.
++pub const MAGIC: u32 = 0x4359_4B53;
++pub const VERSION: u32 = 11;
++/// The mapping's name on Windows; on macOS the POSIX object `/SkyCraft_v1.<uid>`.
++pub const MAPPING_NAME: &str = "SkyCraft_v1";
++
++// ---- regions ------------------------------------------------------------------------------------
++pub const OFF_HEADER: usize = 0x0;
++pub const OFF_SKY_STATE: usize = 0x100;
++pub const OFF_MC_STATE: usize = 0x200;
++pub const OFF_OVERLAY_CTL: usize = 0x300;
++pub const OFF_OVERLAY_SLOT_HDR: usize = 0x340;
++pub const OFF_WATER_GRID: usize = 0x400;
++pub const OFF_INPUT_RING: usize = 0x1000;
++pub const OFF_ACTOR_TABLE: usize = 0x12000;
++pub const OFF_EVENT_RING: usize = 0x17000;
++pub const OFF_WORLD_ENTITIES: usize = 0x1C000;
++pub const OFF_COLLISION_RING: usize = 0x20000;
++pub const COLLISION_RING_BYTES: usize = 32 << 20;
++pub const OFF_OVERLAY_PIXELS: usize = OFF_COLLISION_RING + COLLISION_RING_BYTES;
++pub const MAX_OVERLAY_W: u32 = 3840;
++pub const MAX_OVERLAY_H: u32 = 2160;
++pub const OVERLAY_SLOT_BYTES: usize = MAX_OVERLAY_W as usize * MAX_OVERLAY_H as usize * 4;
++pub const OVERLAY_SLOTS: usize = 3;
++pub const OFF_RENDER_RING: usize = OFF_OVERLAY_PIXELS + OVERLAY_SLOT_BYTES * OVERLAY_SLOTS;
++pub const RENDER_RING_BYTES: usize = 64 << 20;
++pub const MAPPING_BYTES: usize = OFF_RENDER_RING + RENDER_RING_BYTES;
++
++// ---- header -------------------------------------------------------------------------------------
++pub const H_MAGIC: usize = 0;
++pub const H_VERSION: usize = 4;
++pub const H_GAME_PID: usize = 8;
++pub const H_MC_PID: usize = 12;
++pub const H_GAME_HEARTBEAT: usize = 16;
++pub const H_MC_HEARTBEAT: usize = 24;
++
++// ---- game -> Minecraft state (seqlock) ----------------------------------------------------------
++pub const SKY_IN_GAME: u32 = 1 << 0;
++/// A WoW window owns input: Minecraft lets go of held keys.
++pub const SKY_MENU_OPEN: u32 = 1 << 1;
++pub const SKY_LOADING: u32 = 1 << 2;
++/// WowCraft: our character is a ghost; Minecraft runs half again as fast.
++pub const SKY_GHOST: u32 = 1 << 3;
++/// WowCraft: the server moves us (a taxi flight); Minecraft holds where we last put it.
++pub const SKY_CARRIED: u32 = 1 << 4;
++/// WowCraft: on a boat, zeppelin or tram; Minecraft shows "Space: get off".
++pub const SKY_RIDING: u32 = 1 << 5;
++/// WowCraft: the viewport is in physical pixels on a Retina screen; Minecraft scales its GUI up.
++pub const SKY_HIRES: u32 = 1 << 6;
++/// WowCraft: no first-person hands (a bag or another WoW window is over the view).
++pub const SKY_NO_HAND: u32 = 1 << 7;
++/// WowCraft: no left hand (WoW's chat sits where it would be).
++pub const SKY_NO_LEFT_HAND: u32 = 1 << 8;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct SkyState {
++    pub seq: u32,
++    pub flags: u32,
++    /// The map id plus one (0 is "none").
++    pub world_id: u32,
++    /// Bumped on a world change: Minecraft drops every collision region it holds.
++    pub collision_epoch: u32,
++    pub pos: [f64; 3],
++    /// Minecraft degrees: yaw 0 faces +Z, pitch positive looks down.
++    pub yaw: f32,
++    pub pitch: f32,
++    /// Minecraft teleports its player to `pos` when this changes, and acks it in `McState`.
++    pub teleport_seq: u32,
++    pub viewport_w: u32,
++    pub viewport_h: u32,
++    pub game_hour: f32,
++}
++
++pub const WATER_GRID_SIZE: usize = 16;
++pub const NO_WATER: f32 = -1.0e30;
++
++#[repr(C)]
++#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct WaterGrid {
++    pub seq: u32,
++    pub origin_x: i32,
++    pub origin_z: i32,
++    pub world_id: u32,
++    /// `[z * 16 + x]`: the water surface's Minecraft y over that column, or [`NO_WATER`].
++    pub surface: [f32; WATER_GRID_SIZE * WATER_GRID_SIZE],
++}
++
++// ---- Minecraft -> game state (seqlock) ----------------------------------------------------------
++pub const MC_IN_WORLD: u32 = 1 << 0;
++pub const MC_SCREEN_OPEN: u32 = 1 << 1;
++pub const MC_ON_GROUND: u32 = 1 << 2;
++pub const MC_SNEAKING: u32 = 1 << 3;
++pub const MC_SPRINTING: u32 = 1 << 4;
++pub const MC_DEAD: u32 = 1 << 5;
++pub const MC_SWIMMING: u32 = 1 << 6;
++pub const MC_FLYING: u32 = 1 << 7;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct McState {
++    pub seq: u32,
++    pub flags: u32,
++    /// Feet, interpolated to Minecraft's render frame.
++    pub pos: [f64; 3],
++    pub yaw: f32,
++    pub pitch: f32,
++    pub eye_height: f32,
++    pub sensitivity: f32,
++    pub teleport_ack: u32,
++    pub gui_scale: u32,
++    pub frame_counter: u64,
++    /// Vertical, sprint and fluid modifiers included.
++    pub fov_deg: f32,
++    pub bob_phase: f32,
++    pub bob_amount: f32,
++    pub pad4c: u32,
++    pub eye: [f64; 3],
++    /// The physics tick, on the shared clock (nanoseconds), for our own interpolation.
++    pub tick_qpc: i64,
++    pub prev: [f64; 3],
++    pub cur: [f64; 3],
++    pub tick_eye_o: f32,
++    pub tick_eye: f32,
++    pub walk_dist_o: f32,
++    pub walk_dist: f32,
++    pub bob_o: f32,
++    pub bob: f32,
++    pub tick_ms: f32,
++    pub tick_pad: u32,
++    /// 0 first person, 1 behind, 2 in front.
++    pub camera_mode: u32,
++    pub camera_distance: f32,
++    /// WowCraft: Minecraft's hearts, which are our life.
++    pub health: f32,
++    pub max_health: f32,
++    /// WowCraft: Minecraft's mouse sensitivity option (0..1), for our mouse look.
++    pub mouse_sensitivity: f32,
++    pub tail_pad: u32,
++}
++
++// ---- overlay triple buffer ----------------------------------------------------------------------
++pub const OC_STATE: usize = 0;
++pub const OVERLAY_DIRTY: u32 = 1 << 2;
++pub const SLOT_HDR_BYTES: usize = 0x40;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct OverlaySlotHdr {
++    pub width: u32,
++    pub height: u32,
++    /// bit 0: rows are bottom-up.
++    pub flags: u32,
++    pub pad: u32,
++    pub frame_id: u64,
++}
++
++// ---- input ring (game produces) -----------------------------------------------------------------
++pub const INPUT_RING_ENTRIES: u64 = 4096;
++pub const RING_HEAD: usize = 0x00;
++pub const RING_TAIL: usize = 0x40;
++pub const RING_DATA: usize = 0x80;
++
++/// SDL scancode, `a` 1 press / 0 release.
++pub const IN_KEY: u16 = 1;
++/// SDL button (1 left, 2 middle, 3 right, 4 X1, 5 X2), `a` 1 press / 0 release.
++pub const IN_MOUSE_BUTTON: u16 = 2;
++/// `a` = notches × 120, positive up.
++pub const IN_SCROLL: u16 = 3;
++/// `a`, `b` = the cursor in overlay pixels.
++pub const IN_CURSOR: u16 = 4;
++/// `a` = a Unicode code point.
++pub const IN_TEXT: u16 = 5;
++pub const IN_RELEASE_ALL: u16 = 6;
++/// `code` = [`HURT_MELEE`]..., `a` = WoW damage × 100, `b` = the attacker, `c` = flags.
++pub const IN_HURT: u16 = 7;
++pub const IN_OPEN_MENU: u16 = 8;
++/// WowCraft: `code` = the gift table's index (0 experience), `a` = count, `b` = enchant level.
++pub const IN_GIVE: u16 = 9;
++/// WowCraft: `code` = item | count << 8, `a`, `b`, `c` = where, in eighths of a block.
++pub const IN_DROP: u16 = 10;
++/// WowCraft: `code` = the progression tier our level reached.
++pub const IN_TIER: u16 = 11;
++/// WowCraft: `a` | `b` << 32 = the character's guid, whose gear Minecraft keeps.
++pub const IN_CHARACTER: u16 = 12;
++
++pub const HURT_MELEE: u16 = 0;
++pub const HURT_PROJECTILE: u16 = 1;
++pub const HURT_MAGIC: u16 = 2;
++pub const HURT_OTHER: u16 = 3;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct InputEvent {
++    pub kind: u16,
++    pub code: u16,
++    pub a: i32,
++    pub b: i32,
++    pub c: i32,
++}
++
++// ---- actor table (game -> Minecraft, seqlock) ---------------------------------------------------
++pub const MAX_ACTORS: usize = 256;
++pub const AT_RECORDS: usize = 0x40;
++pub const ACTOR_HOSTILE: u32 = 1 << 0;
++pub const ACTOR_DEAD: u32 = 1 << 1;
++pub const ACTOR_ESSENTIAL: u32 = 1 << 2;
++pub const ACTOR_IN_COMBAT: u32 = 1 << 3;
++/// WowCraft: a mining node; `level` is its ore kind.
++pub const ACTOR_ORE: u32 = 1 << 8;
++/// WowCraft: a vendor; Minecraft offers block trades on right-click.
++pub const ACTOR_TRADER: u32 = 1 << 9;
++/// WowCraft: friendly to us (a guard, a quest giver, a party member).
++pub const ACTOR_FRIENDLY: u32 = 1 << 10;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct ActorRecord {
++    pub form_id: u32,
++    pub flags: u32,
++    pub pos: [f32; 3],
++    pub yaw: f32,
++    pub width: f32,
++    pub height: f32,
++    pub health_frac: f32,
++    pub level: u16,
++    pub pad: u16,
++    pub name: [u8; 24],
++}
++
++// ---- event ring (Minecraft produces) ------------------------------------------------------------
++pub const EVENT_RING_ENTRIES: u64 = 512;
++/// `form_id` hit for `a` Minecraft damage; `b`, `c` the knockback direction, `d` its strength.
++pub const EV_HIT_ACTOR: u32 = 1;
++pub const EV_PLAYER_DIED: u32 = 2;
++pub const EV_EXPLOSION: u32 = 3;
++pub const EV_ARROW_STUCK: u32 = 4;
++pub const EV_SKILL_USE: u32 = 5;
++/// WowCraft: the node `form_id` was mined out.
++pub const EV_ORE_MINED: u32 = 6;
++
++pub const HIT_CRITICAL: u32 = 1 << 0;
++pub const HIT_PROJECTILE: u32 = 1 << 1;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct McEvent {
++    pub kind: u32,
++    pub form_id: u32,
++    pub a: f32,
++    pub b: f32,
++    pub c: f32,
++    pub d: f32,
++    pub flags: u32,
++    pub weapon: u32,
++}
++
++// ---- world entities (Minecraft -> game, seqlock) ------------------------------------------------
++pub const MAX_WORLD_ENTITIES: usize = 160;
++pub const WE_RECORDS: usize = 0x40;
++pub const WE_ARROW: u32 = 1;
++pub const WE_ITEM: u32 = 2;
++pub const WE_TRIDENT: u32 = 3;
++pub const WE_BLOCK: u32 = 4;
++pub const WE_CRACK: u32 = 5;
++pub const WE_SHADOW: u32 = 6;
++/// WowCraft: a co-op partner's Minecraft body.
++pub const WE_PLAYER: u32 = 7;
++/// WowCraft: a line (a fishing line, a lead).
++pub const WE_LINE: u32 = 8;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct WorldEntity {
++    pub kind: u32,
++    pub id: u32,
++    pub pos: [f32; 3],
++    pub yaw: f32,
++    pub pitch: f32,
++    pub scale: f32,
++    pub ext: [f32; 3],
++    pub uv: [[f32; 4]; 3],
++    pub tint: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct WorldEntitiesHeader {
++    pub seq: u32,
++    pub count: u32,
++    pub has_selection: u32,
++    pub sel_min: [f32; 3],
++    pub sel_max: [f32; 3],
++    pub pad: [u32; 7],
++}
++
++// ---- render ring (Minecraft produces) -----------------------------------------------------------
++pub const REN_PAD: u32 = 0;
++/// [`RenAtlas`] + RGBA8, top row first.
++pub const REN_ATLAS: u32 = 1;
++/// [`RenSection`] + [`RenVertex`]s (a triangle list); none: the section goes.
++pub const REN_SECTION: u32 = 2;
++pub const REN_CLEAR_ALL: u32 = 3;
++/// [`RenTexture`] + RGBA8: an entity texture (a skin, armour).
++pub const REN_TEXTURE: u32 = 4;
++/// `{batches, vertices}` + [`RenBatch`]es + [`RenVertex`]es: our body this frame, from the feet.
++pub const REN_AVATAR: u32 = 5;
++/// [`RenScene`] + batches + vertices: every other entity and particle, from the scene's origin.
++pub const REN_SCENE: u32 = 6;
++/// [`RenAtlasRegion`] + RGBA8: an animated sprite's frame.
++pub const REN_ATLAS_REGION: u32 = 7;
++/// `{sx, sy, sz, count}` + 8-byte [`RenLight`]s.
++pub const REN_LIGHTS: u32 = 8;
++pub const REN_RAGDOLL: u32 = 9;
++pub const REN_SOLIDS: u32 = 10;
++pub const REN_DUG: u32 = 11;
++/// WowCraft: which terrain cells blocks fill or were dug from, so the land there isn't drawn.
++pub const REN_CUT: u32 = 12;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenSection {
++    pub sx: i32,
++    pub sy: i32,
++    pub sz: i32,
++    pub vertex_count: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenVertex {
++    pub pos: [f32; 3],
++    pub uv: [f32; 2],
++    /// RGBA8, red in the low byte: tint × ambient occlusion.
++    pub color: u32,
++    /// Low byte block light 0-15, next byte sky light 0-15.
++    pub light: u32,
++    /// bit 0 cutout, bit 1 translucent, bits 4-6 the face's Direction ordinal + 1.
++    pub flags: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenBatch {
++    /// 0 the block/item atlas, else a [`RenTexture`] id.
++    pub texture: u32,
++    pub first: u32,
++    pub count: u32,
++    /// bit 0 translucent.
++    pub flags: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenAtlas {
++    pub width: u32,
++    pub height: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenAtlasRegion {
++    pub x: u32,
++    pub y: u32,
++    pub width: u32,
++    pub height: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenTexture {
++    pub id: u32,
++    pub width: u32,
++    pub height: u32,
++    pub pad: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenScene {
++    pub origin: [f64; 3],
++    pub batch_count: u32,
++    pub vertex_count: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenCounts {
++    pub batch_count: u32,
++    pub vertex_count: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenSectionCount {
++    pub sx: i32,
++    pub sy: i32,
++    pub sz: i32,
++    pub count: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct RenLight {
++    pub x: u8,
++    pub y: u8,
++    pub z: u8,
++    pub level: u8,
++    /// RGB8 (red low); top byte: LightKind in bits 0-3, BlockHazard in 4-7.
++    pub color: u32,
++}
++
++// ---- collision ring (game produces) -------------------------------------------------------------
++pub const COL_PAD: u32 = 0;
++/// payload: u32 epoch.
++pub const COL_CLEAR: u32 = 1;
++/// [`ColRegion`] + [`ColBlock`]s: replaces every voxel in the box.
++pub const COL_REGION: u32 = 2;
++/// [`ColRegion`] (count = triangles) + [`ColTri`]s, sent before the region's voxels.
++pub const COL_TRIS: u32 = 3;
++
++pub const TRI_STAIR_HELPER: u32 = 1 << 0;
++pub const TRI_DIGGABLE: u32 = 1 << 1;
++pub const TRI_GHOST: u32 = 1 << 2;
++pub const TRI_TERRAIN: u32 = 1 << 3;
++pub const TRI_MATERIAL_SHIFT: u32 = 8;
++
++pub const DIG_GRASS: u32 = 1;
++pub const DIG_DIRT: u32 = 2;
++pub const DIG_STONE: u32 = 3;
++pub const DIG_SNOW: u32 = 5;
++pub const DIG_SAND: u32 = 7;
++pub const DIG_PLANKS: u32 = 13;
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct ColTri {
++    pub v: [f32; 9],
++    pub flags: u32,
++}
++
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct ColRegion {
++    pub min: [i32; 3],
++    pub max: [i32; 3],
++    pub epoch: u32,
++    pub count: u32,
++}
++
++/// One block's collision as an 8×8×8 mask: `bits[y]` bit `z * 8 + x` is sub-voxel (x, y, z).
++#[repr(C)]
++#[derive(Clone, Copy, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
++pub struct ColBlock {
++    pub pos: [i32; 3],
++    pub pad: u32,
++    pub bits: [u64; 8],
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// The layout the mod's `Proto` names, offset by offset.
++    #[test]
++    fn the_layout_is_the_mods() {
++        assert_eq!(std::mem::size_of::<SkyState>(), 0x40);
++        assert_eq!(std::mem::size_of::<McState>(), 0xD8);
++        assert_eq!(std::mem::offset_of!(McState, eye), 80);
++        assert_eq!(std::mem::offset_of!(McState, tick_qpc), 104);
++        assert_eq!(std::mem::offset_of!(McState, prev), 112);
++        assert_eq!(std::mem::offset_of!(McState, cur), 136);
++        assert_eq!(std::mem::offset_of!(McState, tick_eye_o), 160);
++        assert_eq!(std::mem::offset_of!(McState, tick_ms), 184);
++        assert_eq!(std::mem::offset_of!(McState, camera_mode), 192);
++        assert_eq!(std::mem::offset_of!(McState, health), 200);
++        assert_eq!(std::mem::offset_of!(McState, mouse_sensitivity), 208);
++        assert_eq!(std::mem::size_of::<WaterGrid>(), 16 + 4 * 256);
++        assert_eq!(std::mem::size_of::<ActorRecord>(), 64);
++        assert_eq!(std::mem::offset_of!(ActorRecord, level), 36);
++        assert_eq!(std::mem::offset_of!(ActorRecord, name), 40);
++        assert_eq!(std::mem::size_of::<McEvent>(), 32);
++        assert_eq!(std::mem::size_of::<WorldEntity>(), 96);
++        assert_eq!(std::mem::size_of::<WorldEntitiesHeader>(), WE_RECORDS);
++        assert_eq!(std::mem::size_of::<InputEvent>(), 16);
++        assert_eq!(std::mem::size_of::<RenVertex>(), 32);
++        assert_eq!(std::mem::size_of::<ColTri>(), 40);
++        assert_eq!(std::mem::size_of::<ColRegion>(), 32);
++        assert_eq!(std::mem::size_of::<ColBlock>(), 80);
++        assert_eq!(OFF_OVERLAY_PIXELS, 33_685_504);
++        assert_eq!(OFF_RENDER_RING, 133_218_304);
++        assert_eq!(MAPPING_BYTES, 200_327_168);
++        assert!(OFF_WORLD_ENTITIES + WE_RECORDS + 96 * MAX_WORLD_ENTITIES <= OFF_COLLISION_RING);
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

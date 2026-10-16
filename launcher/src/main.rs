@@ -592,6 +592,10 @@ fn stop_all(paths: &Paths, shared: &Arc<Mutex<Shared>>, server_too: bool) {
             std::thread::sleep(Duration::from_millis(500));
         }
     }
+    // Both games have gone: their link goes too.
+    if !minecraft_running(&paths.game_dir()) && !running().iter().any(|p| p == "benilla") {
+        sys::remove_link();
+    }
     if paths.packaged {
         paths.server().stop_mmaps();
     }

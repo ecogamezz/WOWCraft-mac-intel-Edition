@@ -1,5 +1,5 @@
 #!/bin/sh
-# Assembles dist/WowMacCraft (and dist/WowMacCraft.zip) from what scripts/build-*.sh made under
+# Assembles dist/WowMacCraft (and dist/WowMacCraft.zip) from what scripts/build-deps.sh made under
 # build/: the launcher app, the WoW client (Benilla with the WowCraft module), the WoW server
 # (vmangos), its database (MariaDB) and the Minecraft side (Prism Launcher and the instance).
 #
@@ -44,7 +44,7 @@ benilla="$build/benilla/target/release/benilla"
 vmangos="$build/vmangos-install"
 maria="$build/mariadb-install"
 for need in "$benilla" "$vmangos/bin/mangosd" "$maria/bin/mariadbd"; do
-	[ -e "$need" ] || { echo "missing $need: run scripts/build-all.sh first"; exit 1; }
+	[ -e "$need" ] || { echo "missing $need: run scripts/build-deps.sh first"; exit 1; }
 done
 
 # ---- the launcher ------------------------------------------------------------------------------
