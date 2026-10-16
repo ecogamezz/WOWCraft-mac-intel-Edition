@@ -1,0 +1,19 @@
+[package]
+name = "wowmaccraft-launcher"
+version = "0.1.1"
+edition = "2021"
+description = "WowMacCraft: play, host and join from one window (the macOS port of WowCraft's launcher)"
+license = "MIT"
+
+[[bin]]
+name = "wowmaccraft"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.33"
+rfd = "0.15"
+libc = "0.2"
+
+[profile.release]
+opt-level = "s"
+strip = true

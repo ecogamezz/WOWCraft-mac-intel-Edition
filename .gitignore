@@ -1,0 +1,6 @@
+# Everything fetched and built from source lives here (Benilla, vmangos, MariaDB, tools).
+/build/
+/dist/
+target/
+/mod/build/
+.DS_Store
