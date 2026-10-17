@@ -1,7 +1,7 @@
 From 6ffc2fe723789e73629e44c40b539cacb06b0991 Mon Sep 17 00:00:00 2001
 From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 21:27:36 +0200
-Subject: [PATCH 3/6] WowCraft: combat, life, gifts, water and Minecraft's
+Subject: [PATCH 3/7] WowCraft: combat, life, gifts, water and Minecraft's
  loose things
 
 - combat: WoW's units round us as Minecraft's actor table (hittable stand-ins; friendly ones

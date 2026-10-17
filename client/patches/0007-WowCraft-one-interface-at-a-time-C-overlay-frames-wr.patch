@@ -1,0 +1,490 @@
+From ea169405532935720bcc4ae6c57500e5b3bd8e40 Mon Sep 17 00:00:00 2001
+From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:55:08 +0200
+Subject: [PATCH 7/7] WowCraft: one interface at a time (C), overlay frames
+ written in place, overlay flow report
+
+- C switches the interfaces with the input: in Minecraft's mode WoW's interface is hidden, as
+  Alt-Z hides it (UIParent), and Minecraft's HUD shows; in WoW's mode WoW's interface and cursor
+  show and Minecraft's HUD hides, unless one of its screens is open. Typing in WoW's chat shows
+  WoW's interface too; M, L, B and O switch to WoW's mode.
+- Each overlay frame is written into the one texture in place, in the render world, instead of
+  replacing the image asset's data every frame.
+- Every 10 s while Minecraft is in its world the log says how many overlay frames Minecraft
+  published and we took, and whether the newest one's pixels changed: a player reports Minecraft's
+  HUD frozen on its first frame, which a stand-in Minecraft doesn't reproduce (its frames keep
+  showing), so the next real run says which side stops.
+
+Verified: cargo test --release -p benilla-app --no-default-features --lib wowcraft (44),
+-p wowcraft-link (8); cargo build --release -p benilla --no-default-features; a live run with
+mod/test/CutMinecraft: WoW's interface hidden in Minecraft's mode, the stand-in's moving hotbar
+selection showing, ~96 frames published and taken per 10 s. The C switch itself was not pressed
+live. Built on macOS (Intel) only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/benilla-app/src/wowcraft/input.rs   |  10 ++
+ crates/benilla-app/src/wowcraft/mod.rs     |  30 ++++
+ crates/benilla-app/src/wowcraft/overlay.rs | 190 ++++++++++++++++++---
+ crates/benilla-app/src/wowcraft/ui.rs      |  32 ++--
+ crates/wowcraft-link/src/link.rs           |   8 +
+ crates/wowcraft-link/src/proto.rs          |   2 +
+ 6 files changed, 232 insertions(+), 40 deletions(-)
+
+diff --git a/crates/benilla-app/src/wowcraft/input.rs b/crates/benilla-app/src/wowcraft/input.rs
+index 5412cf62..81ff1462 100644
+--- a/crates/benilla-app/src/wowcraft/input.rs
++++ b/crates/benilla-app/src/wowcraft/input.rs
+@@ -27,6 +27,11 @@ pub(crate) fn is_wow_key(key: KeyCode) -> bool {
+     )
+ }
+ 
++/// WoW's keys that open one of its windows: the map, the quest log, the bags, the social window.
++pub(crate) fn opens_wow_window(key: KeyCode) -> bool {
++    matches!(key, KeyCode::KeyM | KeyCode::KeyL | KeyCode::KeyB | KeyCode::KeyO)
++}
++
+ /// What Minecraft has been told is down, so a hand-over to WoW lets go of exactly that.
+ #[derive(Default)]
+ pub(crate) struct Held {
+@@ -58,6 +63,11 @@ pub(crate) fn forward_input(
+             if ev.state == ButtonState::Pressed && !ev.repeat && ev.key_code == KeyCode::KeyC {
+                 wc.cursor_mode = !wc.cursor_mode;
+                 info!("wowcraft: WoW cursor {}", if wc.cursor_mode { "on" } else { "off" });
++            } else if ev.state == ButtonState::Pressed && !ev.repeat && opens_wow_window(ev.key_code) && !wc.cursor_mode {
++                // WoW's interface is hidden while Minecraft plays: a window's key brings it back,
++                // with the cursor to use it, as C does.
++                wc.cursor_mode = true;
++                info!("wowcraft: WoW cursor on for {:?}", ev.key_code);
+             }
+         }
+     }
+diff --git a/crates/benilla-app/src/wowcraft/mod.rs b/crates/benilla-app/src/wowcraft/mod.rs
+index fbf7901d..1fff4397 100644
+--- a/crates/benilla-app/src/wowcraft/mod.rs
++++ b/crates/benilla-app/src/wowcraft/mod.rs
+@@ -255,6 +255,16 @@ impl WowCraft {
+         self.mc.is_some_and(|m| m.flags & MC_SCREEN_OPEN != 0)
+     }
+ 
++    /// Minecraft's interface (its HUD, hand and screens, [`overlay`]) shows.
++    pub(crate) fn minecraft_ui_shown(&self) -> bool {
++        interfaces_shown(self.mc_in_world(), self.cursor_mode, false, self.mc_screen_open()).1
++    }
++
++    /// WoW's interface shows (`typing`: in its chat).
++    pub(crate) fn wow_ui_shown(&self, typing: bool) -> bool {
++        interfaces_shown(self.mc_in_world(), self.cursor_mode, typing, self.mc_screen_open()).0
++    }
++
+     /// Minecraft has gone where we last put it.
+     fn mc_arrived(&self) -> bool {
+         self.mc.is_some_and(|m| m.teleport_ack == self.teleport_seq)
+@@ -271,6 +281,15 @@ impl WowCraft {
+     }
+ }
+ 
++/// Which interfaces show, WoW's and Minecraft's: one at a time, switched with C along with the
++/// input. Minecraft's in its mode, and whenever one of its screens is open (it has the input
++/// then); WoW's in WoW's mode, while typing in its chat, and whenever Minecraft isn't in its world.
++pub(crate) fn interfaces_shown(mc_in_world: bool, wow_mode: bool, typing: bool, mc_screen: bool) -> (bool, bool) {
++    let minecraft = mc_in_world && (!wow_mode || mc_screen);
++    let wow = !mc_in_world || typing || (wow_mode && !mc_screen);
++    (wow, minecraft)
++}
++
+ /// Whether Minecraft appearing as `pid` starts the overlay swap over: only a process we haven't
+ /// seen, whose link starts its writer at slot 1 (resetting for the same one would leave both sides
+ /// on one slot).
+@@ -562,6 +581,17 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn one_interface_at_a_time() {
++        // (Minecraft in its world, WoW's mode, typing, a Minecraft screen) -> (WoW's, Minecraft's)
++        assert_eq!(interfaces_shown(true, false, false, false), (false, true), "playing Minecraft");
++        assert_eq!(interfaces_shown(true, true, false, false), (true, false), "WoW's mode (C)");
++        assert_eq!(interfaces_shown(true, false, true, false), (true, true), "typing in WoW's chat");
++        assert_eq!(interfaces_shown(true, false, false, true), (false, true), "a Minecraft screen");
++        assert_eq!(interfaces_shown(true, true, false, true), (false, true), "one that opened in WoW's mode");
++        assert_eq!(interfaces_shown(false, false, false, false), (true, false), "no Minecraft");
++    }
++
+     #[test]
+     fn only_a_new_minecraft_restarts_the_overlay() {
+         assert!(overlay_restarts(0, 57319), "the first Minecraft");
+diff --git a/crates/benilla-app/src/wowcraft/overlay.rs b/crates/benilla-app/src/wowcraft/overlay.rs
+index 3673b4ad..35d0da2f 100644
+--- a/crates/benilla-app/src/wowcraft/overlay.rs
++++ b/crates/benilla-app/src/wowcraft/overlay.rs
+@@ -3,22 +3,45 @@
+ //! frame back each frame (transparent where its world would be, premultiplied, bottom-up rows) at
+ //! our window's pixel size, and publishes it through the overlay triple buffer; here it becomes one
+ //! quad over the whole window, painted after all of WoW's interface in the player-UI pass.
++//!
++//! Each frame is written into the one texture in place, in the render world: the player-UI pass
++//! keeps a material per image, whose bind group holds the texture it was made with, so an image
++//! asset replaced or modified every frame would keep showing its first frame.
++//!
++//! It shows while Minecraft's interface does ([`super::WowCraft::minecraft_ui_shown`]): not in
++//! WoW's mode (C), unless one of Minecraft's screens is open.
++
++use std::sync::Arc;
+ 
+ use bevy::asset::RenderAssetUsages;
+ use bevy::math::Rect;
+ use bevy::prelude::*;
+-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
++use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
++use bevy::render::render_asset::RenderAssets;
++use bevy::render::render_resource::{
++    Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDimension, TextureFormat,
++};
++use bevy::render::renderer::RenderQueue;
++use bevy::render::texture::GpuImage;
++use bevy::render::{Render, RenderApp, RenderSystems};
+ use bevy::window::PrimaryWindow;
+ 
+ use super::WowCraft;
+ use crate::char_select::ClientState;
+ use crate::ui_pass::{UiQuad, UiQuads};
+ 
++/// How often the overlay's flow is reported, seconds.
++const REPORT_SECS: f32 = 10.0;
++
+ pub(crate) fn plugin(app: &mut App) {
+-    app.init_resource::<Overlay>().add_systems(
+-        Update,
+-        (take_frame, show_frame.in_set(crate::ui_pass::UiQuadAppend)).chain(),
+-    );
++    app.init_resource::<Overlay>()
++        .init_resource::<OverlayUpload>()
++        .add_plugins(ExtractResourcePlugin::<OverlayUpload>::default())
++        .add_systems(Update, (take_frame, show_frame.in_set(crate::ui_pass::UiQuadAppend), report_flow).chain());
++    // A headless build has no render app.
++    if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
++        render_app.add_systems(Render, write_frame.in_set(RenderSystems::PrepareResources));
++    }
+ }
+ 
+ #[derive(Resource, Default)]
+@@ -27,10 +50,50 @@ struct Overlay {
+     size: UVec2,
+     /// A frame arrived since Minecraft (re)joined its world.
+     ready: bool,
++    /// Frames taken, the newest one's id and a sample of its pixels, for [`report_flow`].
++    taken: u64,
++    frame_id: u64,
++    sample: u64,
++}
++
++/// A cheap fingerprint of a frame: a hash of every 509th byte (a prime, so it walks the columns;
++/// dense enough that a hotbar slot's highlight moving shows).
++fn sample(pixels: &[u8]) -> u64 {
++    pixels.iter().step_by(509).fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3))
++}
++
++/// The newest frame for the render world to write into the overlay's texture: its pixels, top row
++/// first, and a number that changes with each frame.
++#[derive(Resource, Clone, Default, ExtractResource)]
++struct OverlayUpload {
++    image: Option<AssetId<Image>>,
++    size: UVec2,
++    pixels: Arc<Vec<u8>>,
++    seq: u64,
++}
++
++/// A published frame's rows top first: read back from the GPU's origin, `bottom_up`, they come
++/// bottom row first.
++fn top_first(pixels: &[u8], w: u32, h: u32, bottom_up: bool) -> Vec<u8> {
++    let row = (w * 4) as usize;
++    let rows = h as usize;
++    if !bottom_up {
++        return pixels[..row * rows].to_vec();
++    }
++    let mut out = Vec::with_capacity(row * rows);
++    for y in (0..rows).rev() {
++        out.extend_from_slice(&pixels[y * row..(y + 1) * row]);
++    }
++    out
+ }
+ 
+-/// The newest published frame, into our texture.
+-fn take_frame(wc: Res<WowCraft>, mut overlay: ResMut<Overlay>, mut images: ResMut<Assets<Image>>) {
++/// The newest published frame, for the texture.
++fn take_frame(
++    wc: Res<WowCraft>,
++    mut overlay: ResMut<Overlay>,
++    mut upload: ResMut<OverlayUpload>,
++    mut images: ResMut<Assets<Image>>,
++) {
+     if !wc.mc_in_world() {
+         overlay.ready = false;
+         return;
+@@ -44,34 +107,86 @@ fn take_frame(wc: Res<WowCraft>, mut overlay: ResMut<Overlay>, mut images: ResMu
+         return;
+     }
+     let size = UVec2::new(w, h);
++    let frame = top_first(pixels, w, h, header.flags & 1 != 0);
+     if overlay.image.is_none() || overlay.size != size {
+-        let image = Image::new_fill(
++        // A new size is a new texture, made with this frame in it.
++        let image = Image::new(
+             Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+             TextureDimension::D2,
+-            &[0, 0, 0, 0],
++            frame.clone(),
+             // Minecraft's frame is display bytes, as a BLP is: decoded on sampling like the UI's.
+             TextureFormat::Rgba8UnormSrgb,
+-            RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
++            RenderAssetUsages::RENDER_WORLD,
+         );
+-        overlay.image = Some(images.add(image));
++        let handle = images.add(image);
++        upload.image = Some(handle.id());
++        overlay.image = Some(handle);
+         overlay.size = size;
+     }
+-    let Some(image) = overlay.image.as_ref().and_then(|h| images.get_mut(h)) else {
++    overlay.taken += 1;
++    overlay.frame_id = header.frame_id;
++    overlay.sample = sample(&frame);
++    upload.size = size;
++    upload.pixels = Arc::new(frame);
++    upload.seq = upload.seq.wrapping_add(1);
++    overlay.ready = true;
++}
++
++/// Every [`REPORT_SECS`] while Minecraft is in its world: how many frames Minecraft published and
++/// we took, and whether the newest one's pixels changed, which tells a Minecraft that stopped
++/// sending (or sends the same picture) from frames that arrive and don't show.
++fn report_flow(
++    wc: Res<WowCraft>,
++    overlay: Res<Overlay>,
++    time: Res<Time<Real>>,
++    mut next: Local<f32>,
++    mut last: Local<(u64, u64, u64)>,
++) {
++    let now = time.elapsed_secs();
++    if !wc.mc_in_world() || now < *next {
++        return;
++    }
++    *next = now + REPORT_SECS;
++    let published = wc.link.overlay_published();
++    let (last_published, last_taken, last_sample) = *last;
++    info!(
++        "wowcraft: overlay: Minecraft published {published} frames (+{}), we took {} (+{}); newest {}x{} id {}, pixels {} since the last report",
++        published.wrapping_sub(last_published),
++        overlay.taken,
++        overlay.taken - last_taken,
++        overlay.size.x,
++        overlay.size.y,
++        overlay.frame_id,
++        if overlay.sample == last_sample { "unchanged" } else { "changed" },
++    );
++    *last = (published, overlay.taken, overlay.sample);
++}
++
++/// Render world: the newest frame into the overlay's texture, in place, once its texture exists.
++fn write_frame(
++    queue: Res<RenderQueue>,
++    gpu: Res<RenderAssets<GpuImage>>,
++    upload: Option<Res<OverlayUpload>>,
++    mut written: Local<u64>,
++) {
++    let Some(upload) = upload else { return };
++    if upload.seq == *written {
+         return;
++    }
++    let Some(texture) = upload.image.and_then(|id| gpu.get(id)) else {
++        return; // not prepared yet: next frame
+     };
+-    let row = (w * 4) as usize;
+-    let data = image.data.get_or_insert_with(Vec::new);
+-    data.resize(row * h as usize, 0);
+-    if header.flags & 1 != 0 {
+-        // Read back from the GPU's origin, bottom row first: flipped into ours, top first.
+-        for y in 0..h as usize {
+-            let src = (h as usize - 1 - y) * row;
+-            data[y * row..(y + 1) * row].copy_from_slice(&pixels[src..src + row]);
+-        }
+-    } else {
+-        data.copy_from_slice(&pixels[..row * h as usize]);
++    let size = Extent3d { width: upload.size.x, height: upload.size.y, depth_or_array_layers: 1 };
++    if texture.size != size || upload.pixels.len() < (size.width * size.height * 4) as usize {
++        return; // a frame of another size, for a texture still to come
+     }
+-    overlay.ready = true;
++    queue.write_texture(
++        TexelCopyTextureInfo { texture: &texture.texture, mip_level: 0, origin: Origin3d::ZERO, aspect: TextureAspect::All },
++        &upload.pixels,
++        TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size.width * 4), rows_per_image: Some(size.height) },
++        size,
++    );
++    *written = upload.seq;
+ }
+ 
+ /// Over every WoW frame: the append lane's quads sort with the interface's, and this one's key is
+@@ -83,7 +198,7 @@ fn show_frame(
+     window: Query<&Window, With<PrimaryWindow>>,
+     mut quads: ResMut<UiQuads>,
+ ) {
+-    if !overlay.ready || !wc.mc_in_world() || *state.get() != ClientState::InWorld {
++    if !overlay.ready || !wc.minecraft_ui_shown() || *state.get() != ClientState::InWorld {
+         return;
+     }
+     let (Some(image), Ok(window)) = (overlay.image.as_ref(), window.single()) else {
+@@ -98,3 +213,28 @@ fn show_frame(
+         ..default()
+     });
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_bottom_up_frame_comes_out_top_first() {
++        // Two rows of one pixel: the GPU's bottom row (red) first.
++        let bottom_up = [255, 0, 0, 255, 0, 0, 255, 255];
++        assert_eq!(top_first(&bottom_up, 1, 2, true), vec![0, 0, 255, 255, 255, 0, 0, 255]);
++        assert_eq!(top_first(&bottom_up, 1, 2, false), bottom_up.to_vec());
++    }
++
++    #[test]
++    fn a_changed_frame_has_another_sample() {
++        let a = vec![0u8; 3360 * 2100 * 4];
++        let mut b = a.clone();
++        assert_eq!(sample(&a), sample(&b));
++        // A hotbar slot's worth of pixels changing moves it.
++        for p in b[20_000_000..20_000_000 + 40 * 4 * 50].iter_mut() {
++            *p = 200;
++        }
++        assert_ne!(sample(&a), sample(&b));
++    }
++}
+diff --git a/crates/benilla-app/src/wowcraft/ui.rs b/crates/benilla-app/src/wowcraft/ui.rs
+index 583e9251..14c63970 100644
+--- a/crates/benilla-app/src/wowcraft/ui.rs
++++ b/crates/benilla-app/src/wowcraft/ui.rs
+@@ -1,6 +1,7 @@
+ //! WoW's interface under WowCraft, as WowCraft has it:
+-//! - the action bars hide while Minecraft has the input (its hotbar stands where they were) and come
+-//!   back with WoW's cursor (C);
++//! - one interface at a time ([`super::interfaces_shown`]): WoW's is hidden while Minecraft plays,
++//!   as WoW's own Alt-Z hides it, and comes back with WoW's cursor (C, or a WoW window's key) and
++//!   while typing in its chat; Minecraft's HUD hides in turn ([`super::overlay`]);
+ //! - Log Out is off (Minecraft plays along; the launcher's Stop closes everything), and the
+ //!   durability figure, which Minecraft's own armour replaces, is hidden;
+ //! - our own overhead name is off (the Minecraft body has its own), the first-login cinematic is
+@@ -11,11 +12,13 @@ use bevy::prelude::*;
+ 
+ use benilla_ui::script::UiScript;
+ 
+-use super::{InputOwner, WowCraft};
++use super::WowCraft;
+ use crate::char_select::ClientState;
+ 
+-const HIDE_BARS: &str = "for _, n in ipairs({'MainMenuBar', 'MultiBarBottomLeft', 'MultiBarBottomRight', 'ShapeshiftBarFrame', 'PetActionBarFrame'}) do local f = getglobal(n) if f then f:Hide() end end";
+-const SHOW_BARS: &str = "if MainMenuBar then MainMenuBar:Show() end if MultiActionBar_Update then MultiActionBar_Update() end if ShapeshiftBar_Update then ShapeshiftBar_Update() end if PetActionBar_Update then PetActionBar_Update() end";
++/// WoW's whole interface off, as `ToggleUI` (Alt-Z) does it.
++const HIDE_UI: &str = "if UIParent then UIParent:Hide() end";
++/// And back, with the action bars brought up to date.
++const SHOW_UI: &str = "if UIParent then UIParent:Show() end if MainMenuBar then MainMenuBar:Show() end if MultiActionBar_Update then MultiActionBar_Update() end if ShapeshiftBar_Update then ShapeshiftBar_Update() end if PetActionBar_Update then PetActionBar_Update() end";
+ const SETUP: &str = "if GameMenuButtonLogout then GameMenuButtonLogout:Disable() end if DurabilityFrame then pcall(function() DurabilityFrame:UnregisterAllEvents() end) DurabilityFrame:Hide() end";
+ /// What a refused Log Out says, in WoW's system-message gold.
+ pub(crate) const LOGOUT_REFUSED: &str = "if DEFAULT_CHAT_FRAME then DEFAULT_CHAT_FRAME:AddMessage('Log Out is off in WowCraft: Minecraft plays along. Close the game with the launcher\\'s Stop.', 1, 0.82, 0.25) end";
+@@ -23,7 +26,7 @@ pub(crate) const LOGOUT_REFUSED: &str = "if DEFAULT_CHAT_FRAME then DEFAULT_CHAT
+ pub(crate) fn plugin(app: &mut App) {
+     app.add_systems(
+         Update,
+-        (prepare_ui, action_bars, skip_cinematic, mark_tutorials, offer_minecraft_name).after(crate::ui_script::UiInput),
++        (prepare_ui, wow_interface, skip_cinematic, mark_tutorials, offer_minecraft_name).after(crate::ui_script::UiInput),
+     );
+ }
+ 
+@@ -46,11 +49,11 @@ fn prepare_ui(
+     }
+ }
+ 
+-/// The action bars follow who has the input.
+-fn action_bars(
++/// WoW's interface shows only when it's WoW's turn.
++fn wow_interface(
+     script: Option<NonSendMut<UiScript>>,
+-    owner: Res<InputOwner>,
+     wc: Res<WowCraft>,
++    capture: Res<crate::ui_script::UiKeyboardCapture>,
+     state: Res<State<ClientState>>,
+     mut shown: Local<Option<bool>>,
+     mut memo: Local<crate::ui_script::VmMemo<bool>>,
+@@ -60,22 +63,21 @@ fn action_bars(
+         *shown = None;
+         return;
+     }
+-    // A fresh interface starts with them shown.
++    // A fresh interface starts shown.
+     if memo.claim(&script) {
+         *shown = None;
+     }
+-    // Shown with WoW's cursor or with no Minecraft to play; hidden while Minecraft plays.
+-    let want = !owner.minecraft || !wc.mc_in_world();
++    let want = wc.wow_ui_shown(capture.typing);
+     if *shown == Some(want) {
+         return;
+     }
+-    let chunk = if want { SHOW_BARS } else { HIDE_BARS };
++    let chunk = if want { SHOW_UI } else { HIDE_UI };
+     match script.run_chunk(chunk.as_bytes()) {
+         Ok(()) => {
+-            info!("wowcraft: action bars {}", if want { "shown" } else { "hidden" });
++            info!("wowcraft: WoW's interface {}", if want { "shown" } else { "hidden; Minecraft's shows (C switches)" });
+             *shown = Some(want);
+         }
+-        Err(e) => warn!("wowcraft: couldn't change the action bars: {e}"),
++        Err(e) => warn!("wowcraft: couldn't switch WoW's interface: {e}"),
+     }
+ }
+ 
+diff --git a/crates/wowcraft-link/src/link.rs b/crates/wowcraft-link/src/link.rs
+index 69df9e93..c10f4927 100644
+--- a/crates/wowcraft-link/src/link.rs
++++ b/crates/wowcraft-link/src/link.rs
+@@ -385,6 +385,11 @@ impl Link {
+         true
+     }
+ 
++    /// How many overlay frames Minecraft has published since its link opened.
++    pub fn overlay_published(&self) -> u64 {
++        self.u64_at(OFF_OVERLAY_CTL + OC_PUBLISHED).load(Ordering::Acquire)
++    }
++
+     /// Minecraft (re)connected: its writer starts again at slot 1.
+     pub fn reset_overlay(&self) {
+         self.u32_at(OFF_OVERLAY_CTL + OC_STATE).store(0, Ordering::Release);
+@@ -523,5 +528,8 @@ mod tests {
+         let (hdr, pixels) = t.link.overlay_front();
+         assert_eq!((hdr.width, hdr.height, pixels.len()), (2, 1, 8));
+         assert_eq!(t.link.u32_at(OFF_OVERLAY_CTL).load(Ordering::Relaxed), 2, "our old front is its next middle");
++        // The mod counts its frames up after each publish.
++        t.link.u64_at(OFF_OVERLAY_CTL + OC_PUBLISHED).store(42, Ordering::Release);
++        assert_eq!(t.link.overlay_published(), 42);
+     }
+ }
+diff --git a/crates/wowcraft-link/src/proto.rs b/crates/wowcraft-link/src/proto.rs
+index cf54cc0c..e8c16972 100644
+--- a/crates/wowcraft-link/src/proto.rs
++++ b/crates/wowcraft-link/src/proto.rs
+@@ -147,6 +147,8 @@ pub struct McState {
+ 
+ // ---- overlay triple buffer ----------------------------------------------------------------------
+ pub const OC_STATE: usize = 0;
++/// How many frames Minecraft has published (`u64`, it counts up after each).
++pub const OC_PUBLISHED: usize = 8;
+ pub const OVERLAY_DIRTY: u32 = 1 << 2;
+ pub const SLOT_HDR_BYTES: usize = 0x40;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

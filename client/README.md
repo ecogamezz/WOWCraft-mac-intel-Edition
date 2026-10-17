@@ -18,7 +18,8 @@ applies the patches with `git am` and builds `build/benilla/target/release/benil
 - `crates/benilla-app/src/wowcraft/`, on only when the launcher starts WoW with `WOWCRAFT=1`:
   - `mod.rs`: the link's beat, who owns input, Minecraft's player driving ours (the controller's
     puppet branch in `player/puppet.rs`), teleports Minecraft must follow, the view and FOV;
-  - `input.rs`: keyboard and mouse to Minecraft (SDL scancodes), WoW keeping C, Enter, M, L, B, O;
+  - `input.rs`: keyboard and mouse to Minecraft (SDL scancodes), WoW keeping C, Enter, M, L, B, O
+    (C, and a WoW window's key, switch to WoW's mode);
   - `account.rs`: the automatic login from the launcher's account file;
   - `collision.rs`: WoW's world (terrain, buildings, doodads) as Minecraft's collision, exact
     triangles and voxel masks, on a background thread;
@@ -32,13 +33,15 @@ applies the patches with `git am` and builds `build/benilla/target/release/benil
   - `head_portrait.rs`: the skin's face as the player portrait;
   - `labels.rs`: "Block trader (right-click)" under innkeepers and general goods vendors, and
     co-op partners' name tags;
-  - `overlay.rs`: Minecraft's HUD and screens over WoW's interface;
+  - `overlay.rs`: Minecraft's HUD and screens over WoW's world, each frame written into one
+    texture in place;
   - `water.rs`: WoW's water and lava as Minecraft's;
   - `combat.rs`: WoW's creatures as hittable stand-ins, Minecraft hits as WoW damage, WoW damage
     as Minecraft's, ore veins, herbs and stations as Minecraft blocks, kill loot;
   - `life.rs`: Minecraft's hearts as our life (god mode, death, release, revive);
   - `gifts.rs`: quest rewards, experience and each character's own Minecraft inventory;
-  - `ui.rs`: WoW's interface under WowCraft (action bars, Log Out, cinematic, tutorials, name).
+  - `ui.rs`: WoW's interface under WowCraft (shown only in WoW's mode, Log Out, cinematic,
+    tutorials, name).
 - Small hooks elsewhere in Benilla: the controller's puppet branch, the input gates in the
   bindings and the camera, Log Out refused, the automatic login and character creation helpers,
   the chat filter for the module's own GM command answers, the terrain cut volume

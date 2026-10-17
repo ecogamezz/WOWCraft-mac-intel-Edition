@@ -1,7 +1,7 @@
 From 0c56195d343a0df030e2e289a751dfca19dceb29 Mon Sep 17 00:00:00 2001
 From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 05:05:29 +0200
-Subject: [PATCH 6/6] WowCraft: Minecraft's HUD on a Retina Mac, and our WoW
+Subject: [PATCH 6/7] WowCraft: Minecraft's HUD on a Retina Mac, and our WoW
  body hidden in third person
 
 - The overlay: Minecraft (SDL) sizes its window in points, so on a Retina Mac the physical size

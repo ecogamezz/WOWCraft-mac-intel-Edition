@@ -81,6 +81,27 @@ public final class CutMinecraft {
 				java.util.Arrays.copyOfRange(chars, 0, 3), java.util.Arrays.copyOfRange(chars, 3, 15), 0);
 	}
 
+	/** VisualMinecraft's HUD with the selected hotbar slot moving every second, so a run can see
+	 *  whether new overlay frames reach the screen. */
+	static void publishMovingHud(int w, int h, int selected) {
+		java.lang.foreign.MemorySegment s = SkyLink.segment();
+		if (s == null || w <= 0 || h <= 0) return;
+		long base = SkyLink.overlayBackSlotOffset();
+		java.lang.foreign.MemorySegment.copy(new byte[w * h * 4], 0, s, java.lang.foreign.ValueLayout.JAVA_BYTE, base, w * h * 4);
+		int unit = Math.max(2, h / 270);
+		int barW = 182 * unit, barH = 22 * unit, bx = (w - barW) / 2, by = h - barH - unit * 2;
+		for (int yTop = by; yTop < by + barH; yTop++) {
+			int y = h - 1 - yTop;
+			for (int x = bx; x < bx + barW; x++) {
+				int slot = (x - bx) / (20 * unit);
+				boolean edge = (x - bx) % (20 * unit) < unit || yTop - by < unit || by + barH - yTop <= unit;
+				int c = edge ? 0xFF606060 : (slot == selected ? 0xFF2A9DF4 : 0xB0202020);
+				s.set(java.lang.foreign.ValueLayout.JAVA_INT, base + ((long) y * w + x) * 4, c);
+			}
+		}
+		SkyLink.publishOverlay(w, h, true, System.nanoTime());
+	}
+
 	public static void main(String[] args) throws Exception {
 		long total = Long.parseLong(args.length > 0 ? args[0] : "90") * 1000;
 		String skin = args.length > 1 ? args[1] : null;
@@ -160,7 +181,7 @@ public final class CutMinecraft {
 				}
 				if (onGround && now >= nextOverlay) {
 					nextOverlay = now + 100;
-					VisualMinecraft.publishOverlay(sky.viewportW, sky.viewportH);
+					publishMovingHud(sky.viewportW, sky.viewportH, (int) ((now - start) / 1000 % 9));
 				}
 				mc.flags = Proto.MC_IN_WORLD | (onGround ? Proto.MC_ON_GROUND : 0);
 				mc.x = cur[0]; mc.y = cur[1]; mc.z = cur[2];

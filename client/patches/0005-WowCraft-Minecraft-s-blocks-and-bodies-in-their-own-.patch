@@ -1,7 +1,7 @@
 From 1fcbf0fb07500afe783aec64d1857949ed3b84ea Mon Sep 17 00:00:00 2001
 From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
 Date: Sat, 17 Oct 2026 03:59:41 +0200
-Subject: [PATCH 5/6] WowCraft: Minecraft's blocks and bodies in their own
+Subject: [PATCH 5/7] WowCraft: Minecraft's blocks and bodies in their own
  colours
 
 blocks.rs uploaded the block atlas and entity textures as Rgba8UnormSrgb and turned Minecraft's

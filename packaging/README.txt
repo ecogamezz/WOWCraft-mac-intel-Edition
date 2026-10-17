@@ -36,10 +36,11 @@ Playing with friends
 - Join: paste a friend's link, press Join. Their server makes your WoW account;
   WoW logs in by itself once Minecraft has joined them.
 
-Controls: you play with Minecraft's controls inside WoW. C frees the mouse
-cursor (for WoW's windows and chat). Enter opens WoW chat, M the map, L the
-quest log, B the bags and O WoW's menu; E is Minecraft's inventory, T its chat
-and Esc its menu.
+Controls: you play with Minecraft's controls inside WoW, with Minecraft's
+HUD. C switches to WoW: its interface and the mouse cursor, Minecraft's HUD
+hidden; C again switches back. Enter opens WoW chat; M the map, L the quest
+log, B the bags and O WoW's menu switch to WoW too. E is Minecraft's
+inventory, T its chat and Esc its menu.
 
 Stop closes everything: WoW, Minecraft (it saves first) and the server (it
 saves characters). Quitting the launcher does the same.

@@ -1,7 +1,7 @@
 From b40bb43f249228fb72454f351675bcca8ebe4446 Mon Sep 17 00:00:00 2001
 From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
 Date: Fri, 16 Oct 2026 17:16:21 +0200
-Subject: [PATCH 1/6] WowCraft on macOS: the Minecraft link and the drive
+Subject: [PATCH 1/7] WowCraft on macOS: the Minecraft link and the drive
 
 wowcraft-link: the SkyCraft shared-memory protocol (version 11 with
 WowCraft's additions) and the game's end of it on POSIX shared memory,
