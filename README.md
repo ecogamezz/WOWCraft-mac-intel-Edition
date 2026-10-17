@@ -43,6 +43,10 @@ scripts/package.sh
 fetches WowCraft v0.1.1 (for its database, configs and Minecraft instance) and Prism Launcher
 11.1.1 for macOS, builds the launcher, patches the mod for macOS and assembles
 `dist/WowMacCraft/` and `dist/WowMacCraft.zip`. `scripts/package.sh --no-zip` skips the zip.
+A rebuild keeps a played `dist/WowMacCraft`'s state (the launcher's settings, the database, the
+server's maps and logs, the bundled Prism's sign-in and instance with its worlds, the WoW client's
+`benilla-config`) and only replaces the package around it; the zip never carries that state. Quit
+WowMacCraft before rebuilding: the script stops while anything runs from that folder.
 
 If the C++ build of MariaDB or vmangos fails on `<cstddef>` or similar, an old Command Line Tools
 install has left stale headers in `/Library/Developer/CommandLineTools/usr/include/c++/v1`; the

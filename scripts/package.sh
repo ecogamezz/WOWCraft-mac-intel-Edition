@@ -9,13 +9,34 @@
 #   extractor data, and the Minecraft instance and its mods (jars, with WowCraft's patched for macOS);
 # - Prism Launcher's official macOS build.
 #
+# A dist/WowMacCraft that has been played keeps its state, as an install that a newer package is
+# unzipped over does: the package is assembled (and zipped) in dist/.new, and the old folder's
+# own files move into it before it takes the old one's place (the end of this script).
+#
 #   scripts/package.sh [--no-zip]
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 build="$root/build"
 dist="$root/dist"
-out="$dist/WowMacCraft"
+install="$dist/WowMacCraft"
+out="$dist/.new/WowMacCraft"
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/launcher/Cargo.toml" | head -1)
+
+# The launcher, the servers, Prism or Minecraft running from the install hold its state open.
+in_use() {
+	procs=$(ps -axww -o pid=,command=)
+	if printf '%s\n' "$procs" | grep -F "$install/"; then
+		echo "WowMacCraft is running from $install: quit it (Stop, then close the launcher) and build again"
+		exit 1
+	fi
+}
+in_use
+# Only a rebuild cut short while swapping folders (the end of this script) leaves dist/.old.
+if [ -e "$dist/.old" ]; then
+	echo "$dist/.old is left from a rebuild cut short and may hold the install's state: move it back to $install"
+	exit 1
+fi
+rm -rf "$dist/.new" "$dist/.trash"
 
 wowcraft_tag=v0.1.1
 prism_version=11.1.1
@@ -49,7 +70,6 @@ done
 
 # ---- the launcher ------------------------------------------------------------------------------
 (cd "$root/launcher" && cargo build --release)
-rm -rf "$out"
 mkdir -p "$out"
 app="$out/WowMacCraft.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
@@ -119,9 +139,38 @@ cp "$root/packaging/README.txt" "$out/README.txt"
 codesign --force --sign - "$out/wow/benilla" "$out/server/"* "$out/mariadb/bin/"* 2>/dev/null || true
 codesign --force --sign - "$app"
 
+# The zip is the package alone: made before a played install's files join it.
 if [ "${1:-}" != "--no-zip" ]; then
 	rm -f "$dist/WowMacCraft.zip"
-	(cd "$dist" && ditto -c -k --keepParent WowMacCraft WowMacCraft.zip)
+	(cd "$dist/.new" && ditto -c -k --keepParent WowMacCraft "$dist/WowMacCraft.zip")
 	echo "$dist/WowMacCraft.zip ($(du -h "$dist/WowMacCraft.zip" | cut -f1))"
 fi
-echo "$out"
+
+# ---- the install -------------------------------------------------------------------------------
+# A played install's own files move into the new package (renames, so nothing is copied or
+# changed): the launcher's settings, the database (made from data-clean on the first Play), the
+# server's maps (made from the player's WoW; beside the package's own config.json and offmesh.txt
+# in server/data) and logs, the bundled Prism's data (the Microsoft sign-in, the instance with its
+# worlds) and the WoW client's settings and logs. The rest of the old install goes.
+in_use
+trap '' HUP INT TERM
+if [ -d "$install" ]; then
+	mv "$install" "$dist/.old"
+	for p in wowmaccraft-launcher.cfg wowmaccraft-server.log mariadb/data server/logs prism/data \
+		wow/benilla-config wow/run_out.txt wow/run_err.txt; do
+		if [ -e "$dist/.old/$p" ]; then
+			rm -rf "$out/$p"
+			mv "$dist/.old/$p" "$out/$p"
+		fi
+	done
+	for p in "$dist/.old/server/data/"*; do
+		if [ -e "$p" ] && [ ! -e "$out/server/data/$(basename "$p")" ]; then
+			mv "$p" "$out/server/data/"
+		fi
+	done
+	mv "$dist/.old" "$dist/.trash"
+fi
+mv "$out" "$install"
+trap - HUP INT TERM
+rm -rf "$dist/.new" "$dist/.trash"
+echo "$install"
