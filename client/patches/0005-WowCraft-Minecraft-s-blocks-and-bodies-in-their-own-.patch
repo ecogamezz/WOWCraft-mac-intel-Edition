@@ -1,0 +1,136 @@
+From 1fcbf0fb07500afe783aec64d1857949ed3b84ea Mon Sep 17 00:00:00 2001
+From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:59:41 +0200
+Subject: [PATCH 5/5] WowCraft: Minecraft's blocks and bodies in their own
+ colours
+
+blocks.rs uploaded the block atlas and entity textures as Rgba8UnormSrgb and turned Minecraft's
+vertex tints to linear, but WoW's world framebuffer holds gamma bytes (WoW's own textures are
+un-encoded, unlit materials write their colour raw, FFXGlow decodes once), so every block, our
+body and the scene came out decoded twice. Measured live with mod/test/VisualMinecraft's atlas
+(ffxGlow off, Northshire, sky light 15): a sunlit grass top face (atlas 90,170,60) drew
+26,103,12 and a north dirt face (138,96,67 x 0.8) 52,24,12; the overlay's hotbar in the same
+shot read its exact bytes, so the capture is true.
+
+- Textures upload un-encoded (Rgba8Unorm), as WoW's and mc_body's do.
+- Vertex tints and Minecraft's light multiply the bytes raw; srgb_to_linear goes.
+- The fishing line's grey passes raw (linear_rgba), as the overhead names' colours do.
+- The vertex test uses a real tint (plains grass) and a new test checks the texture format.
+
+After: the top face draws 90,169,60 (second texel 68,138,46, exact), the north faces
+111,77,53 and the west faces 82,58,41 (138,96,67 x 0.6 = 83,58,40).
+
+Verified: cargo test --release -p benilla-app --no-default-features --lib wowcraft (38);
+cargo build --release -p benilla --no-default-features; the live run above, before and after.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/benilla-app/src/wowcraft/blocks.rs | 42 ++++++++++++++---------
+ 1 file changed, 25 insertions(+), 17 deletions(-)
+
+diff --git a/crates/benilla-app/src/wowcraft/blocks.rs b/crates/benilla-app/src/wowcraft/blocks.rs
+index 8821d52b..6c23cf68 100644
+--- a/crates/benilla-app/src/wowcraft/blocks.rs
++++ b/crates/benilla-app/src/wowcraft/blocks.rs
+@@ -9,6 +9,10 @@
+ //! light levels through its brightness curve, and its fixed face shading (up 1.0, down 0.5,
+ //! north/south 0.8, east/west 0.6), which the mod leaves for us to apply.
+ //!
++//! Colours stay gamma bytes throughout, as Minecraft draws them and as WoW's world framebuffer holds
++//! them (it decodes once, at FFXGlow): the textures are un-encoded and the vertex colours and light
++//! multiply the bytes raw, so a sunlit top face shows its texture's own bytes.
++//!
+ //! With the sections come their cells ([`super::cut`]: what blocks fill and what was dug, which
+ //! WoW's terrain leaves out, and what collides); with the textures, our own skin
+ //! ([`super::mc_body::McSkin`]). From the world entity table come the shadows Minecraft casts
+@@ -419,7 +423,8 @@ fn draw_world_entities(
+                 quads.push([a + up * w, b + up * w, b - up * w, a - up * w], e.uv[0]);
+                 quads.push([a + side * w, b + side * w, b - side * w, a - side * w], e.uv[0]);
+             }
+-            WE_LINE => gizmos.line(p, Vec3::from(e.ext), Color::srgba(0.1, 0.1, 0.1, 0.8)),
++            // `linear_rgba` passes the grey raw into the gamma framebuffer, as the blocks' colours.
++            WE_LINE => gizmos.line(p, Vec3::from(e.ext), Color::linear_rgba(0.1, 0.1, 0.1, 0.8)),
+             WE_SHADOW => {
+                 // On the highest of a Minecraft block under it and WoW's ground.
+                 let block = cells.block_top_under(p + Vec3::Y * 0.01, SHADOW_REACH as i32);
+@@ -664,15 +669,6 @@ fn face_normal(dir: u32) -> [f32; 3] {
+     }
+ }
+ 
+-fn srgb_to_linear(c: u8) -> f32 {
+-    let c = c as f32 / 255.0;
+-    if c <= 0.04045 {
+-        c / 12.92
+-    } else {
+-        ((c + 0.055) / 1.055).powf(2.4)
+-    }
+-}
+-
+ /// A triangle list of Minecraft vertices; `shade` applies the block faces' fixed shading.
+ fn mesh_of(verts: &[RenVertex], shade: bool) -> Mesh {
+     let mut pos = Vec::with_capacity(verts.len());
+@@ -687,8 +683,9 @@ fn mesh_of(verts: &[RenVertex], shade: bool) -> Mesh {
+         let sky = (v.light >> 8) & 0xF;
+         let lit = brightness(block).max(brightness(sky)).max(0.04);
+         let k = lit * if shade { face_shade(dir) } else { 1.0 };
+-        let c = v.color.to_le_bytes();
+-        col.push([srgb_to_linear(c[0]) * k, srgb_to_linear(c[1]) * k, srgb_to_linear(c[2]) * k, c[3] as f32 / 255.0]);
++        // Minecraft's tint bytes, raw: the framebuffer is gamma bytes, as Minecraft's is.
++        let c = v.color.to_le_bytes().map(|b| b as f32 / 255.0);
++        col.push([c[0] * k, c[1] * k, c[2] * k, c[3]]);
+         nrm.push(face_normal(dir));
+     }
+     Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD)
+@@ -698,13 +695,14 @@ fn mesh_of(verts: &[RenVertex], shade: bool) -> Mesh {
+         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, col)
+ }
+ 
+-/// Pixel art stays pixels: nearest filtering, as Minecraft draws it.
++/// Pixel art stays pixels: nearest filtering, as Minecraft draws it. Un-encoded RGBA8, as WoW's own
++/// textures are: an sRGB format would decode bytes the gamma framebuffer already holds as they are.
+ fn nearest_image(w: u32, h: u32, pixels: &[u8]) -> Image {
+     let mut image = Image::new_fill(
+         Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+         TextureDimension::D2,
+         &[0, 0, 0, 0],
+-        TextureFormat::Rgba8UnormSrgb,
++        TextureFormat::Rgba8Unorm,
+         RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
+     );
+     let n = (w * h * 4) as usize;
+@@ -744,10 +742,12 @@ mod tests {
+ 
+     #[test]
+     fn a_vertex_gets_its_face_and_light() {
++        // Plains grass's tint, which must reach the gamma framebuffer as its own bytes.
++        let tint = [0x91, 0xBD, 0x59, 255];
+         let v = RenVertex {
+             pos: [0.0, 1.0, 0.0],
+             uv: [0.5, 0.5],
+-            color: u32::from_le_bytes([255, 255, 255, 255]),
++            color: u32::from_le_bytes(tint),
+             light: 15 << 8,
+             // Up (ordinal 1) is stored as 2.
+             flags: 2 << 4,
+@@ -755,8 +755,16 @@ mod tests {
+         let down = RenVertex { flags: 1 << 4, ..v };
+         let mesh = mesh_of(&[v, down, v], true);
+         let Some(bevy::mesh::VertexAttributeValues::Float32x4(c)) = mesh.attribute(Mesh::ATTRIBUTE_COLOR) else { panic!() };
+-        assert_eq!(c[0], [1.0, 1.0, 1.0, 1.0], "a sunlit top face");
+-        assert_eq!(c[1][0], 0.5, "a bottom face at half");
++        let byte = |i: usize| tint[i] as f32 / 255.0;
++        assert_eq!(c[0], [byte(0), byte(1), byte(2), 1.0], "a sunlit top face keeps the tint's bytes, undecoded");
++        assert_eq!(c[1][0], byte(0) * 0.5, "a bottom face at half the byte");
++    }
++
++    #[test]
++    fn textures_upload_undecoded() {
++        let image = nearest_image(1, 1, &[90, 170, 60, 255]);
++        assert_eq!(image.texture_descriptor.format, TextureFormat::Rgba8Unorm, "WoW's world framebuffer holds gamma bytes");
++        assert_eq!(image.data.as_deref(), Some(&[90, 170, 60, 255][..]));
+     }
+ 
+     /// A `WE_PLAYER` record as the mod writes it: the name's UTF-16 units in `ext`, `uv`, `scale`.
+-- 
+2.50.1 (Apple Git-155)
+
