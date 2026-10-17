@@ -19,7 +19,10 @@ import javax.imageio.ImageIO;
  * screenshot then shows the land cut, the name tag and the shadow; the client's log says how many
  * cells it cut and that our face is the portrait.
  *
- *   java ... CutMinecraft.java <total seconds> <skin.png>
+ * With a camera mode of 1 (Minecraft's view from behind, 4 blocks back) the screenshot also shows
+ * whether anything of our WoW body is drawn: this stand-in sends no body of its own.
+ *
+ *   java ... CutMinecraft.java <total seconds> <skin.png> [camera mode]
  */
 public final class CutMinecraft {
 	static ByteBuffer le(int n) {
@@ -81,6 +84,7 @@ public final class CutMinecraft {
 	public static void main(String[] args) throws Exception {
 		long total = Long.parseLong(args.length > 0 ? args[0] : "90") * 1000;
 		String skin = args.length > 1 ? args[1] : null;
+		int cameraMode = args.length > 2 ? Integer.parseInt(args[2]) : 0;
 		long start = System.currentTimeMillis();
 		var sky = new SkyLink.SkyState();
 		var mc = new SkyLink.McState();
@@ -140,7 +144,7 @@ public final class CutMinecraft {
 							&& sendCells(Proto.REN_DUG, dug, sky.worldId)
 							&& (skin == null || sendSkin(skin));
 					hole = new double[] {cx + 0.5, cur[1], cz + 0.5};
-					System.out.printf("cut minecraft: hole at %d %d (%d cells), block at %d %d %d, world %d, sent %b%n", cx, cz, dug.size(), bx, by, bz, sky.worldId, ok);
+					System.out.printf("cut minecraft: hole at %d %d (%d cells), block at %d %d %d, world %d, viewport %dx%d (flags %#x), sent %b%n", cx, cz, dug.size(), bx, by, bz, sky.worldId, sky.viewportW, sky.viewportH, sky.flags, ok);
 					sent = true;
 				}
 				if (hole != null) {
@@ -164,6 +168,7 @@ public final class CutMinecraft {
 				mc.eyeX = cur[0]; mc.eyeY = cur[1] + 1.62; mc.eyeZ = cur[2];
 				mc.fov = 70f; mc.teleportAck = known ? ack : ack - 1;
 				mc.health = 20f; mc.maxHealth = 20f; mc.mouseSensitivity = 0.5f;
+				mc.cameraMode = cameraMode; mc.cameraDistance = 4f;
 				mc.frameCounter++;
 				SkyLink.writeMcState(mc);
 			}

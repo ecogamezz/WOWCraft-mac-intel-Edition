@@ -1,0 +1,273 @@
+From 0c56195d343a0df030e2e289a751dfca19dceb29 Mon Sep 17 00:00:00 2001
+From: ecogamezz <33791269+ecogamezz@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 05:05:29 +0200
+Subject: [PATCH 6/6] WowCraft: Minecraft's HUD on a Retina Mac, and our WoW
+ body hidden in third person
+
+- The overlay: Minecraft (SDL) sizes its window in points, so on a Retina Mac the physical size
+  we sent it made a 6720 x 4200 frame, which the mod's FrameExporter drops (past 3840 x 2160):
+  no HUD ever arrived. On macOS Minecraft now gets our size and the cursor in points, and its
+  frame comes out at our pixel size (minecraft_viewport, MINECRAFT_IN_POINTS).
+- The overlay swap resets only for a new Minecraft process: a stalled heartbeat (Minecraft
+  loading its world) came back to the same process and the reset left both sides on one slot.
+- Our WoW body (and a co-op partner's) is hidden after the exterior cull, which set every body
+  it admits back to Inherited each frame: in third person the whole WoW character showed
+  under the Minecraft body.
+
+Verified: cargo test --release -p benilla-app --no-default-features --lib wowcraft (41),
+-p wowcraft-link (8); cargo build --release -p benilla --no-default-features; a live run with
+mod/test/CutMinecraft in Minecraft's third-person view: the WoW body, drawn before, is gone,
+and the stand-in receives the viewport in points (1280x800 for a 2560x1600 window). The real
+Minecraft HUD needs a run with real Minecraft. Built on macOS (Intel) only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/benilla-app/src/wowcraft/blocks.rs | 54 ++++++++++++++-----
+ crates/benilla-app/src/wowcraft/input.rs  |  6 ++-
+ crates/benilla-app/src/wowcraft/mod.rs    | 65 +++++++++++++++++++++--
+ crates/wowcraft-link/src/proto.rs         |  5 +-
+ 4 files changed, 109 insertions(+), 21 deletions(-)
+
+diff --git a/crates/benilla-app/src/wowcraft/blocks.rs b/crates/benilla-app/src/wowcraft/blocks.rs
+index 6c23cf68..66cba3da 100644
+--- a/crates/benilla-app/src/wowcraft/blocks.rs
++++ b/crates/benilla-app/src/wowcraft/blocks.rs
+@@ -50,13 +50,27 @@ const PARTNER_NEAR: f32 = 16.0;
+ pub(crate) struct BlocksSet;
+ 
+ pub(crate) fn plugin(app: &mut App) {
+-    app.init_resource::<Scene>().init_resource::<Partners>().add_systems(
+-        Update,
+-        (drain_render, place_avatar, hide_wow_body, draw_world_entities, hide_partner_bodies)
+-            .chain()
+-            .in_set(BlocksSet)
+-            .after(crate::player::PlayerControlSet),
+-    );
++    app.init_resource::<Scene>()
++        .init_resource::<Partners>()
++        .add_systems(
++            Update,
++            (drain_render, place_avatar, draw_world_entities).chain().in_set(BlocksSet).after(crate::player::PlayerControlSet),
++        )
++        .add_systems(PostUpdate, after_the_cull((hide_wow_body.run_if(mc_in_world), hide_partner_bodies)));
++}
++
++/// Last before visibility propagates: the exterior cull sets every body it admits back to
++/// `Inherited` each frame, so a body hidden any earlier is drawn all the same.
++fn after_the_cull<M>(
++    systems: impl bevy::ecs::schedule::IntoScheduleConfigs<bevy::ecs::system::ScheduleSystem, M>,
++) -> bevy::ecs::schedule::ScheduleConfigs<bevy::ecs::system::ScheduleSystem> {
++    systems
++        .after(benilla_world::exterior_cull::ExteriorCullSet)
++        .before(bevy::camera::visibility::VisibilitySystems::VisibilityPropagate)
++}
++
++fn mc_in_world(wc: Res<WowCraft>) -> bool {
++    wc.mc_in_world()
+ }
+ 
+ /// A co-op partner Minecraft has near us: their Minecraft entity, their name (a WowCraft player's
+@@ -314,11 +328,9 @@ fn place_avatar(scene: Res<Scene>, player: Res<crate::player::Player>, mut q: Qu
+     }
+ }
+ 
+-/// Our WoW body isn't drawn: we are the Minecraft body (first person shows only its hand).
+-fn hide_wow_body(wc: Res<WowCraft>, mut bodies: Query<&mut Visibility, With<crate::net::SelfPlayer>>) {
+-    if !wc.mc_in_world() {
+-        return;
+-    }
++/// Our WoW body isn't drawn: we are the Minecraft body (first person shows only its hand, and
++/// the camera's own self-fade hides the WoW body there anyway).
++fn hide_wow_body(mut bodies: Query<&mut Visibility, With<crate::net::SelfPlayer>>) {
+     for mut v in &mut bodies {
+         if *v != Visibility::Hidden {
+             *v = Visibility::Hidden;
+@@ -801,6 +813,24 @@ mod tests {
+         assert!(!is_partner(&partners, "", Vec3::new(10.0, 0.0, 10.0)));
+     }
+ 
++    /// Our WoW body stays hidden though the exterior cull admits it every frame.
++    #[test]
++    fn the_wow_body_stays_hidden_past_the_exterior_cull() {
++        let mut app = App::new();
++        let cull = |mut bodies: Query<&mut Visibility>| {
++            for mut v in &mut bodies {
++                *v = Visibility::Inherited;
++            }
++        };
++        app.add_systems(PostUpdate, cull.in_set(benilla_world::exterior_cull::ExteriorCullSet))
++            .add_systems(PostUpdate, after_the_cull(hide_wow_body));
++        let me = app.world_mut().spawn((crate::net::SelfPlayer, Visibility::Inherited)).id();
++        for _ in 0..3 {
++            app.update();
++            assert_eq!(app.world().get::<Visibility>(me), Some(&Visibility::Hidden));
++        }
++    }
++
+     #[test]
+     fn shadows_fade_as_minecrafts_do() {
+         assert_eq!(shadow_alpha(0.0, 0.0), 0.5, "half dark at the feet");
+diff --git a/crates/benilla-app/src/wowcraft/input.rs b/crates/benilla-app/src/wowcraft/input.rs
+index dcfa9374..5412cf62 100644
+--- a/crates/benilla-app/src/wowcraft/input.rs
++++ b/crates/benilla-app/src/wowcraft/input.rs
+@@ -134,9 +134,11 @@ pub(crate) fn forward_input(
+     }
+ 
+     if screen {
+-        // The cursor, in the overlay's (physical) pixels, when it moves.
++        // The cursor, in the units Minecraft's window is sized in (`super::minecraft_viewport`),
++        // when it moves.
+         if let Ok(w) = window.single() {
+-            if let Some(p) = w.physical_cursor_position() {
++            let cursor = if super::MINECRAFT_IN_POINTS { w.cursor_position() } else { w.physical_cursor_position() };
++            if let Some(p) = cursor {
+                 let at = (p.x as i32, p.y as i32);
+                 if held.cursor != Some(at) {
+                     wc.link.push_input(IN_CURSOR, 0, at.0, at.1, 0);
+diff --git a/crates/benilla-app/src/wowcraft/mod.rs b/crates/benilla-app/src/wowcraft/mod.rs
+index 051d2329..fbf7901d 100644
+--- a/crates/benilla-app/src/wowcraft/mod.rs
++++ b/crates/benilla-app/src/wowcraft/mod.rs
+@@ -177,8 +177,12 @@ pub(crate) struct WowCraft {
+     pub(crate) link: Arc<Link>,
+     /// Minecraft's last state, while it's alive.
+     pub(crate) mc: Option<McState>,
+-    /// The Minecraft process we last saw, so a restart resets the overlay swap.
++    /// The Minecraft process we see now, 0 while it's gone.
+     mc_pid: u32,
++    /// The last Minecraft process we saw at all, so only a new one resets the overlay swap (a
++    /// stalled heartbeat, as while Minecraft loads its world, comes back to the same process,
++    /// whose writer slot is where it was).
++    last_mc_pid: u32,
+     /// C toggles WoW's cursor: on, WoW has the mouse and keyboard, Minecraft stands still.
+     pub(crate) cursor_mode: bool,
+     /// Our view, Minecraft degrees (what `SkyState` carries).
+@@ -208,6 +212,7 @@ impl WowCraft {
+             link,
+             mc: None,
+             mc_pid: 0,
++            last_mc_pid: 0,
+             cursor_mode: false,
+             look_yaw: 0.0,
+             look_pitch: 0.0,
+@@ -266,6 +271,13 @@ impl WowCraft {
+     }
+ }
+ 
++/// Whether Minecraft appearing as `pid` starts the overlay swap over: only a process we haven't
++/// seen, whose link starts its writer at slot 1 (resetting for the same one would leave both sides
++/// on one slot).
++fn overlay_restarts(last_pid: u32, pid: u32) -> bool {
++    pid != 0 && pid != last_pid
++}
++
+ /// Minecraft's yaw (degrees, 0 facing +Z) of our yaw (radians, 0 facing −Z), and back.
+ pub(crate) fn mc_yaw_of(bevy_yaw: f32) -> f32 {
+     wrap_degrees(180.0 - bevy_yaw.to_degrees())
+@@ -297,7 +309,10 @@ fn tick_link(
+     if pid != wc.mc_pid {
+         if pid != 0 {
+             info!("wowcraft: Minecraft is here (pid {pid})");
+-            wc.link.reset_overlay();
++            if overlay_restarts(wc.last_mc_pid, pid) {
++                wc.link.reset_overlay();
++            }
++            wc.last_mc_pid = pid;
+         } else {
+             info!("wowcraft: Minecraft has gone");
+         }
+@@ -482,10 +497,11 @@ fn publish_sky_state(
+     if self_store.single().is_ok_and(|s| s.0.player_is_ghost()) {
+         flags |= SKY_GHOST;
+     }
+-    let (w, h, hires) = window
++    let (size, hires) = window
+         .single()
+-        .map(|w| (w.physical_width(), w.physical_height(), w.scale_factor() > 1.0))
+-        .unwrap_or((1280, 800, false));
++        .map(|w| minecraft_viewport(UVec2::new(w.physical_width(), w.physical_height()), w.scale_factor(), MINECRAFT_IN_POINTS))
++        .unwrap_or((UVec2::new(1280, 800), false));
++    let (w, h) = (size.x, size.y);
+     if hires {
+         flags |= SKY_HIRES;
+     }
+@@ -508,6 +524,23 @@ fn publish_sky_state(
+     wc.link.write_sky_state(&state);
+ }
+ 
++/// Minecraft sizes its window (SDL) in the display's points. On macOS a Retina window has twice as
++/// many pixels as points, so Minecraft gets our size, and the cursor, in points there, and its
++/// frame (which the mod reads back as the overlay, and drops past 3840 × 2160) comes out at our
++/// pixel size. Elsewhere a window is sized in pixels, and Minecraft gets ours.
++pub(crate) const MINECRAFT_IN_POINTS: bool = cfg!(target_os = "macos");
++
++/// The viewport Minecraft sizes its window to, for our window `physical` pixels at `scale`, and
++/// whether it is a high-DPI window's pixels ([`SKY_HIRES`]: Minecraft scales its GUI up).
++pub(crate) fn minecraft_viewport(physical: UVec2, scale: f32, in_points: bool) -> (UVec2, bool) {
++    let hires = scale > 1.0;
++    if in_points && hires {
++        ((physical.as_vec2() / scale).round().as_uvec2().max(UVec2::ONE), false)
++    } else {
++        (physical, hires)
++    }
++}
++
+ /// The launcher's files for us (`WOWCRAFT_*_FILE`), read when there.
+ pub(crate) fn env_file(var: &str) -> Option<PathBuf> {
+     std::env::var_os(var).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
+@@ -529,6 +562,28 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn only_a_new_minecraft_restarts_the_overlay() {
++        assert!(overlay_restarts(0, 57319), "the first Minecraft");
++        assert!(!overlay_restarts(57319, 57319), "back from a stall");
++        assert!(overlay_restarts(57319, 60001), "a restarted Minecraft");
++        assert!(!overlay_restarts(57319, 0));
++    }
++
++    /// On a Retina Mac Minecraft gets points, so its doubled frame is our window's pixels and stays
++    /// under the overlay's 3840 × 2160; elsewhere it gets pixels.
++    #[test]
++    fn minecraft_gets_the_size_its_window_is_measured_in() {
++        let retina = UVec2::new(3360, 2100);
++        assert_eq!(minecraft_viewport(retina, 2.0, true), (UVec2::new(1680, 1050), false));
++        assert_eq!(minecraft_viewport(retina, 2.0, false), (retina, true));
++        assert_eq!(minecraft_viewport(UVec2::new(1920, 1080), 1.0, true), (UVec2::new(1920, 1080), false));
++        let (points, _) = minecraft_viewport(retina, 2.0, true);
++        assert!(points.x * 2 <= MAX_OVERLAY_W && points.y * 2 <= MAX_OVERLAY_H);
++        // A fractional scale rounds to whole points.
++        assert_eq!(minecraft_viewport(UVec2::new(2880, 1800), 1.5, true).0, UVec2::new(1920, 1200));
++    }
++
+     /// A Minecraft yaw points the same way our yaw does.
+     #[test]
+     fn a_yaw_points_the_same_way() {
+diff --git a/crates/wowcraft-link/src/proto.rs b/crates/wowcraft-link/src/proto.rs
+index 2f00560b..cf54cc0c 100644
+--- a/crates/wowcraft-link/src/proto.rs
++++ b/crates/wowcraft-link/src/proto.rs
+@@ -51,7 +51,7 @@ pub const SKY_GHOST: u32 = 1 << 3;
+ pub const SKY_CARRIED: u32 = 1 << 4;
+ /// WowCraft: on a boat, zeppelin or tram; Minecraft shows "Space: get off".
+ pub const SKY_RIDING: u32 = 1 << 5;
+-/// WowCraft: the viewport is in physical pixels on a Retina screen; Minecraft scales its GUI up.
++/// WowCraft: the viewport is a high-DPI window's physical pixels; Minecraft scales its GUI up.
+ pub const SKY_HIRES: u32 = 1 << 6;
+ /// WowCraft: no first-person hands (a bag or another WoW window is over the view).
+ pub const SKY_NO_HAND: u32 = 1 << 7;
+@@ -173,7 +173,8 @@ pub const IN_KEY: u16 = 1;
+ pub const IN_MOUSE_BUTTON: u16 = 2;
+ /// `a` = notches × 120, positive up.
+ pub const IN_SCROLL: u16 = 3;
+-/// `a`, `b` = the cursor in overlay pixels.
++/// `a`, `b` = the cursor in the viewport's units (`SkyState::viewport_w`: Minecraft's window
++/// coordinates).
+ pub const IN_CURSOR: u16 = 4;
+ /// `a` = a Unicode code point.
+ pub const IN_TEXT: u16 = 5;
+-- 
+2.50.1 (Apple Git-155)
+
